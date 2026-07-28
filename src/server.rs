@@ -257,11 +257,8 @@ pub trait ServerHandler: Clone + Send + Sync + 'static {
     /// Handlers that process multi-argument requests sequentially may have
     /// applied earlier arguments when a later one fails. Callers requiring an
     /// exact remote state must reconnect and resubscribe their confirmed set.
-    async fn handle_request(
-        &self,
-        client_id: u64,
-        request: ControlRequest,
-    ) -> Result<ControlReply>;
+    async fn handle_request(&self, client_id: u64, request: ControlRequest)
+    -> Result<ControlReply>;
     async fn select_aeron(&self, _client_id: u64, _config: AeronConfig) -> Result<()> {
         anyhow::bail!("Aeron is not supported by this server handler")
     }

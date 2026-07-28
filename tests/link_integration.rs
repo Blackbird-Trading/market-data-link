@@ -149,9 +149,8 @@ async fn udp_reference_counts_and_binary_delivery() {
 async fn udp_client_delivers_payloads_without_subscription_or_codec_filtering() {
     let handler = MockHandler::default();
     let address = free_tcp_address();
-    let task = tokio::spawn(
-        Server::new(ServerConfig::tcp(address.to_string()), handler.clone()).run(),
-    );
+    let task =
+        tokio::spawn(Server::new(ServerConfig::tcp(address.to_string()), handler.clone()).run());
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     let mut client = Client::connect(ClientConfig::new(
@@ -224,9 +223,8 @@ async fn aeron_configuration_is_negotiated_with_backend() {
 async fn udp_is_negotiated_and_delivers_backend_frames() {
     let backend = MockHandler::default();
     let address = free_tcp_address();
-    let task = tokio::spawn(
-        Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run(),
-    );
+    let task =
+        tokio::spawn(Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run());
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     let mut client = Client::connect(ClientConfig::new(
@@ -311,9 +309,8 @@ async fn udp_is_negotiated_and_delivers_backend_frames() {
 async fn acknowledgement_commits_counts_and_rejection_preserves_them() {
     let backend = MockHandler::default();
     let address = free_tcp_address();
-    let task = tokio::spawn(
-        Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run(),
-    );
+    let task =
+        tokio::spawn(Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run());
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     let mut client = Client::connect(ClientConfig::new(
@@ -346,9 +343,8 @@ async fn acknowledgement_commits_counts_and_rejection_preserves_them() {
 async fn acknowledgement_wait_buffers_existing_data_keepalives_and_unsolicited_errors() {
     let backend = MockHandler::default();
     let address = free_tcp_address();
-    let task = tokio::spawn(
-        Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run(),
-    );
+    let task =
+        tokio::spawn(Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run());
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     let mut config = ClientConfig::new(
@@ -418,8 +414,7 @@ async fn acknowledgement_wait_buffers_existing_data_keepalives_and_unsolicited_e
     for _ in 0..10 {
         match client.poll_control().await.unwrap() {
             Some(ClientEvent::Keepalive) => saw_keepalive = true,
-            Some(ClientEvent::StreamError(error)) if error.message == "unsolicited" =>
-            {
+            Some(ClientEvent::StreamError(error)) if error.message == "unsolicited" => {
                 saw_unsolicited = true
             }
             _ => {}
@@ -429,10 +424,7 @@ async fn acknowledgement_wait_buffers_existing_data_keepalives_and_unsolicited_e
         }
     }
     let mut buffer = [0; 128];
-    assert_eq!(
-        client.recv_udp(&mut buffer).await.unwrap().bytes,
-        feature
-    );
+    assert_eq!(client.recv_udp(&mut buffer).await.unwrap().bytes, feature);
     assert!(saw_keepalive);
     assert!(saw_unsolicited);
     task.abort();
@@ -442,8 +434,7 @@ async fn acknowledgement_wait_buffers_existing_data_keepalives_and_unsolicited_e
 async fn udp_reconnect_renegotiates_with_a_new_ephemeral_port() {
     let backend = MockHandler::default();
     let address = free_tcp_address();
-    let task =
-        tokio::spawn(Server::new(ServerConfig::tcp(address.to_string()), backend).run());
+    let task = tokio::spawn(Server::new(ServerConfig::tcp(address.to_string()), backend).run());
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     let mut client = Client::connect(ClientConfig::new(
@@ -466,9 +457,8 @@ async fn udp_reconnect_renegotiates_with_a_new_ephemeral_port() {
 async fn subscriptions_are_rejected_before_transport_selection() {
     let backend = MockHandler::default();
     let address = free_tcp_address();
-    let task = tokio::spawn(
-        Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run(),
-    );
+    let task =
+        tokio::spawn(Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run());
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
@@ -506,9 +496,8 @@ async fn aeron_is_rejected_when_disabled_on_either_side() {
 
     let backend = MockHandler::default();
     let address = free_tcp_address();
-    let task = tokio::spawn(
-        Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run(),
-    );
+    let task =
+        tokio::spawn(Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run());
     tokio::time::sleep(Duration::from_millis(30)).await;
     let mut config = ClientConfig::new(
         ControlEndpoint::Tcp(format!("ws://{address}")),
@@ -529,9 +518,8 @@ async fn aeron_is_rejected_when_disabled_on_either_side() {
 async fn reconnect_restores_each_subscription_exactly_once() {
     let backend = MockHandler::default();
     let address = free_tcp_address();
-    let task = tokio::spawn(
-        Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run(),
-    );
+    let task =
+        tokio::spawn(Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run());
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     let mut client = Client::connect(ClientConfig::new(
@@ -568,8 +556,7 @@ async fn reconnect_restores_each_subscription_exactly_once() {
 async fn keepalive_ping_receives_a_pong() {
     let backend = MockHandler::default();
     let address = free_tcp_address();
-    let task =
-        tokio::spawn(Server::new(ServerConfig::tcp(address.to_string()), backend).run());
+    let task = tokio::spawn(Server::new(ServerConfig::tcp(address.to_string()), backend).run());
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     let mut config = ClientConfig::new(
@@ -597,9 +584,8 @@ async fn keepalive_ping_receives_a_pong() {
 async fn polling_client_correlates_requests_and_polls_udp_data() {
     let backend = MockHandler::default();
     let address = free_tcp_address();
-    let task = tokio::spawn(
-        Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run(),
-    );
+    let task =
+        tokio::spawn(Server::new(ServerConfig::tcp(address.to_string()), backend.clone()).run());
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     let mut client = tokio::task::spawn_blocking(move || {

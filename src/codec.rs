@@ -5,7 +5,6 @@ pub const TRADE_MESSAGE_TYPE: u8 = 2;
 pub const SNAPSHOT_MESSAGE_TYPE: u8 = 3;
 pub const DEPTH_UPDATE_MESSAGE_TYPE: u8 = 4;
 pub const STATUS_MESSAGE_TYPE: u8 = 0;
-pub const ERROR_MESSAGE_TYPE: u8 = 5;
 pub const FEATURE_BBO_MESSAGE_TYPE: u8 = 6;
 
 pub const BBO_WIRE_LEN: usize = 61;

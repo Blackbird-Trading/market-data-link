@@ -371,6 +371,8 @@ latency measurement, and reconnect policy.
   `ControlReply::Error`.
 - Asynchronous runtime failures use `ControlEvent::StreamError` and retain
   optional ID/stream scope, severity, message, and producer timestamp.
+- Runtime errors have no binary data-frame discriminator. They are serialized
+  only as typed JSON events on the control WebSocket.
 - Scoped stream errors go only to matching subscribers; incomplete scope is
   global. They travel over the reliable control WebSocket for UDP and Aeron
   clients alike.

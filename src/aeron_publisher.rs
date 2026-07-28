@@ -374,11 +374,7 @@ impl<F: PublicationFactory> AeronPublisher<F> {
         completions
     }
 
-    pub fn update_subscriptions(
-        &mut self,
-        client_id: u64,
-        request: &ControlRequest,
-    ) -> Result<()> {
+    pub fn update_subscriptions(&mut self, client_id: u64, request: &ControlRequest) -> Result<()> {
         if !self.client_groups.contains_key(&client_id) {
             return Ok(());
         }
@@ -419,10 +415,9 @@ impl<F: PublicationFactory> AeronPublisher<F> {
     pub fn publish(&mut self, frame: AeronFrame<'_>) -> AeronPublishReport {
         let mut report = AeronPublishReport::default();
         let keys = match frame.route {
-            AeronRoute::Stream { id, stream } => self
-                .routes
-                .get(&id)
-                .and_then(|streams| streams.get(stream)),
+            AeronRoute::Stream { id, stream } => {
+                self.routes.get(&id).and_then(|streams| streams.get(stream))
+            }
             AeronRoute::MarketStatus { market_id } => self.market_groups.get(&market_id),
         };
         let Some(keys) = keys else {
@@ -670,11 +665,7 @@ mod tests {
         );
     }
 
-    fn subscribe(
-        router: &mut AeronPublisher<FakeFactory>,
-        client_id: u64,
-        arg: SubscriptionArg,
-    ) {
+    fn subscribe(router: &mut AeronPublisher<FakeFactory>, client_id: u64, arg: SubscriptionArg) {
         router
             .update_subscriptions(client_id, &ControlRequest::subscribe(vec![arg]))
             .unwrap();
@@ -753,9 +744,7 @@ mod tests {
         subscribe(&mut router, 2, SubscriptionArg::new([10], "bbo"));
 
         assert_eq!(
-            router
-                .publish(AeronFrame::new(10, "bbo", b"frame"))
-                .offered,
+            router.publish(AeronFrame::new(10, "bbo", b"frame")).offered,
             2
         );
         assert_eq!(state.borrow().registrations.len(), 2);

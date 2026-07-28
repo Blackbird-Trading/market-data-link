@@ -82,10 +82,10 @@ fn protocol_validation_rejects_empty_and_invalid_values() {
 
 #[test]
 fn client_transport_configuration_is_tagged_and_minimal() {
-    assert!(serde_json::from_value::<ClientTransportConfig>(
-        serde_json::json!({"type": "websocket"})
-    )
-    .is_err());
+    assert!(
+        serde_json::from_value::<ClientTransportConfig>(serde_json::json!({"type": "websocket"}))
+            .is_err()
+    );
     assert_eq!(
         serde_json::to_value(ClientTransportConfig::Udp).unwrap(),
         serde_json::json!({"type": "udp"})
@@ -113,10 +113,12 @@ fn runtime_stream_errors_are_distinct_from_request_errors() {
             .into_stream_error(),
         error
     );
-    assert!(serde_json::from_value::<ControlReply>(
-        serde_json::json!({"type":"stream_error","severity":3,"message":"x","timestamp":1})
-    )
-    .is_err());
+    assert!(
+        serde_json::from_value::<ControlReply>(
+            serde_json::json!({"type":"stream_error","severity":3,"message":"x","timestamp":1})
+        )
+        .is_err()
+    );
 }
 
 #[test]

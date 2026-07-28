@@ -211,9 +211,9 @@ impl Client {
             anyhow::bail!("control WebSocket closed");
         };
         match frame? {
-            Message::Binary(_) => anyhow::bail!(
-                "binary frames are not allowed on the control WebSocket"
-            ),
+            Message::Binary(_) => {
+                anyhow::bail!("binary frames are not allowed on the control WebSocket")
+            }
             Message::Text(text) => {
                 let event = parse_client_event(&text)?;
                 Ok(Some(event))
@@ -347,9 +347,9 @@ impl Client {
                 .await
                 .context("control WebSocket closed while awaiting request acknowledgement")??;
             match frame {
-                Message::Binary(_) => anyhow::bail!(
-                    "binary frames are not allowed on the control WebSocket"
-                ),
+                Message::Binary(_) => {
+                    anyhow::bail!("binary frames are not allowed on the control WebSocket")
+                }
                 Message::Text(text) => {
                     if let Ok(event) = serde_json::from_str::<ControlEvent>(&text) {
                         let error = event.into_stream_error();
