@@ -641,7 +641,6 @@ async fn polling_client_correlates_requests_and_polls_udp_data() {
             &format!("ws://{address}"),
             Duration::from_secs(2),
             ClientTransportConfig::Udp,
-            false,
         )
     })
     .await

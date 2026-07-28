@@ -52,11 +52,7 @@ impl PollingClient {
         address: &str,
         timeout: Duration,
         transport: ClientTransportConfig,
-        aeron_enabled: bool,
     ) -> Result<Self> {
-        if transport.is_aeron() && !aeron_enabled {
-            anyhow::bail!("Aeron transport selected while [aeron].enabled is false");
-        }
         #[cfg(feature = "aeron")]
         let (aeron_subscriber, aeron_udp_port) = match &transport {
             ClientTransportConfig::AeronUdp { stream_id } => {
@@ -109,11 +105,9 @@ impl PollingClient {
                     .local_addr()?
                     .port(),
             },
-            ClientTransportConfig::AeronIpc { stream_id } => {
-                TransportSelection::AeronIpc {
-                    stream_id: *stream_id,
-                }
-            }
+            ClientTransportConfig::AeronIpc { stream_id } => TransportSelection::AeronIpc {
+                stream_id: *stream_id,
+            },
             ClientTransportConfig::AeronUdp { stream_id } => TransportSelection::AeronUdp {
                 client_port: aeron_udp_port
                     .context("Aeron UDP subscription endpoint was not prepared")?,
@@ -126,9 +120,7 @@ impl PollingClient {
         loop {
             match control.read()? {
                 Message::Text(text) => match serde_json::from_str::<ControlReply>(&text)? {
-                    ControlReply::TransportReady {
-                        transport: ready,
-                    } => {
+                    ControlReply::TransportReady { transport: ready } => {
                         match (&transport, ready) {
                             (
                                 ClientTransportConfig::Udp,
