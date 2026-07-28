@@ -101,21 +101,23 @@ impl PollingClient {
             _ => None,
         };
 
-        let selection = match transport {
+        let selection = match &transport {
             ClientTransportConfig::Udp => TransportSelection::Udp {
                 client_port: udp
                     .as_ref()
-                    .expect("UDP socket must exist")
+                    .context("UDP socket was not prepared")?
                     .local_addr()?
                     .port(),
             },
             ClientTransportConfig::AeronIpc { stream_id } => {
-                TransportSelection::AeronIpc { stream_id }
+                TransportSelection::AeronIpc {
+                    stream_id: *stream_id,
+                }
             }
             ClientTransportConfig::AeronUdp { stream_id } => TransportSelection::AeronUdp {
                 client_port: aeron_udp_port
                     .context("Aeron UDP subscription endpoint was not prepared")?,
-                stream_id,
+                stream_id: *stream_id,
             },
         };
         control.send(Message::Text(
@@ -124,11 +126,42 @@ impl PollingClient {
         loop {
             match control.read()? {
                 Message::Text(text) => match serde_json::from_str::<ControlReply>(&text)? {
-                    ControlReply::TransportReady { transport } => {
-                        if let TransportReady::Udp { server_address } = transport {
-                            udp.as_ref()
-                                .expect("server returned UDP for a non-UDP client")
-                                .connect(server_address)?;
+                    ControlReply::TransportReady {
+                        transport: ready,
+                    } => {
+                        match (&transport, ready) {
+                            (
+                                ClientTransportConfig::Udp,
+                                TransportReady::Udp { server_address },
+                            ) => {
+                                udp.as_ref()
+                                    .context("UDP socket was not prepared")?
+                                    .connect(server_address)?;
+                            }
+                            (
+                                ClientTransportConfig::AeronIpc {
+                                    stream_id: requested,
+                                },
+                                TransportReady::AeronIpc {
+                                    stream_id: negotiated,
+                                },
+                            ) if requested == &negotiated => {}
+                            (
+                                ClientTransportConfig::AeronUdp {
+                                    stream_id: requested,
+                                },
+                                TransportReady::AeronUdp {
+                                    endpoint,
+                                    stream_id: negotiated,
+                                },
+                            ) if requested == &negotiated
+                                && aeron_udp_port == Some(endpoint.port()) => {}
+                            (requested, negotiated) => {
+                                anyhow::bail!(
+                                    "server returned incompatible transport during negotiation: \
+                                     requested {requested:?}, returned {negotiated:?}"
+                                )
+                            }
                         }
                         break;
                     }
