@@ -9,9 +9,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use market_data_link::{
-    AeronConfig, Client, ClientConfig, ClientTransportConfig, ControlReply, ControlRequest,
-    PollEvent, PollingClient, Server, ServerConfig, ServerHandler, SessionChannels, SessionControl,
-    StreamError, SubscriptionArg, SubscriptionKey,
+    AeronConfig, Client, ClientConfig, ClientTransportConfig, ControlReply, ControlReplyEnvelope,
+    ControlRequest, ControlRequestEnvelope, PollEvent, PollingClient, SelectTransport, Server,
+    ServerConfig, ServerHandler, SessionChannels, SessionControl, StreamError, SubscriptionArg,
+    SubscriptionKey, TransportReady, TransportSelection,
     client::ClientEvent,
     codec::{Bbo, FeatureBbo},
     transport::ControlEndpoint,
@@ -187,10 +188,7 @@ async fn aeron_configuration_is_negotiated_with_backend() {
     server_config.aeron_enabled = true;
     let task = tokio::spawn(Server::new(server_config, backend.clone()).run());
     tokio::time::sleep(Duration::from_millis(30)).await;
-    let config = AeronConfig {
-        aeron_channel: market_data_link::AeronChannel::Ipc,
-        stream_id: 2001,
-    };
+    let config = AeronConfig::Ipc { stream_id: 2001 };
     let mut client_config = ClientConfig::new(
         ControlEndpoint::Tcp(format!("ws://{address}")),
         ClientTransportConfig::AeronIpc { stream_id: 2001 },
@@ -214,7 +212,53 @@ async fn aeron_configuration_is_negotiated_with_backend() {
         .clone();
     assert!(
         sender.send(vec![1]).await.is_err(),
-        "Aeron negotiation must drop the legacy per-session receiver"
+        "Aeron negotiation must drop the per-session UDP receiver"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn aeron_udp_uses_control_peer_ip_and_client_resolved_port() {
+    let backend = MockHandler::default();
+    let address = free_tcp_address();
+    let mut server_config = ServerConfig::tcp(address.to_string());
+    server_config.aeron_enabled = true;
+    let task = tokio::spawn(Server::new(server_config, backend.clone()).run());
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&SelectTransport::new(TransportSelection::AeronUdp {
+                client_port: 40123,
+                stream_id: 2002,
+            }))
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let Message::Text(reply) = socket.next().await.unwrap().unwrap() else {
+        panic!("expected text transport reply");
+    };
+    assert_eq!(
+        serde_json::from_str::<ControlReply>(&reply).unwrap(),
+        ControlReply::TransportReady {
+            transport: TransportReady::AeronUdp {
+                endpoint: "127.0.0.1:40123".parse().unwrap(),
+                stream_id: 2002,
+            },
+        }
+    );
+    assert_eq!(
+        backend.aeron.lock().await[0].1,
+        AeronConfig::Udp {
+            endpoint: "127.0.0.1:40123".parse().unwrap(),
+            stream_id: 2002,
+        }
     );
     task.abort();
 }
@@ -467,7 +511,9 @@ async fn subscriptions_are_rejected_before_transport_selection() {
     let request = ControlRequest::subscribe(vec![SubscriptionArg::new([42], "bbo")]);
     socket
         .send(Message::Text(
-            serde_json::to_string(&request).unwrap().into(),
+            serde_json::to_string(&ControlRequestEnvelope::new(1, request))
+                .unwrap()
+                .into(),
         ))
         .await
         .unwrap();
@@ -476,7 +522,9 @@ async fn subscriptions_are_rejected_before_transport_selection() {
         panic!("expected text control reply");
     };
     assert!(matches!(
-        serde_json::from_str::<ControlReply>(&reply).unwrap(),
+        serde_json::from_str::<ControlReplyEnvelope>(&reply)
+            .unwrap()
+            .reply,
         ControlReply::Error { message }
             if message.contains("select_transport")
     ));
@@ -607,7 +655,7 @@ async fn polling_client_correlates_requests_and_polls_udp_data() {
         .unwrap();
     loop {
         match client.poll().unwrap() {
-            Some(PollEvent::Reply(reply)) if reply.request_id == Some(request_id) => break,
+            Some(PollEvent::Reply(reply)) if reply.request_id == request_id => break,
             _ => tokio::time::sleep(Duration::from_millis(1)).await,
         }
     }

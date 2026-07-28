@@ -20,9 +20,18 @@ struct StreamKey {
 
 impl From<AeronConfig> for StreamKey {
     fn from(config: AeronConfig) -> Self {
-        Self {
-            channel: config.aeron_channel,
-            stream_id: config.stream_id,
+        match config {
+            AeronConfig::Ipc { stream_id } => Self {
+                channel: AeronChannel::Ipc,
+                stream_id,
+            },
+            AeronConfig::Udp {
+                endpoint,
+                stream_id,
+            } => Self {
+                channel: AeronChannel::udp(endpoint.ip().to_string(), endpoint.port()),
+                stream_id,
+            },
         }
     }
 }
@@ -646,13 +655,7 @@ mod tests {
     fn join(router: &mut AeronPublisher<FakeFactory>, client_id: u64, stream_id: i32) {
         assert_eq!(
             router
-                .add_client(
-                    client_id,
-                    AeronConfig {
-                        aeron_channel: AeronChannel::Ipc,
-                        stream_id,
-                    },
-                )
+                .add_client(client_id, AeronConfig::Ipc { stream_id },)
                 .unwrap(),
             JoinStatus::Pending
         );
@@ -677,13 +680,7 @@ mod tests {
         join(&mut router, 1, 1001);
         assert_eq!(
             router
-                .add_client(
-                    2,
-                    AeronConfig {
-                        aeron_channel: AeronChannel::Ipc,
-                        stream_id: 1001,
-                    },
-                )
+                .add_client(2, AeronConfig::Ipc { stream_id: 1001 },)
                 .unwrap(),
             JoinStatus::Ready
         );
@@ -758,8 +755,8 @@ mod tests {
                 router
                     .add_client(
                         client_id,
-                        AeronConfig {
-                            aeron_channel: AeronChannel::udp("127.0.0.1", port),
+                        AeronConfig::Udp {
+                            endpoint: format!("127.0.0.1:{port}").parse().unwrap(),
                             stream_id: 1001,
                         },
                     )
@@ -806,13 +803,7 @@ mod tests {
         join(&mut router, 1, 1001);
         assert_eq!(
             router
-                .add_client(
-                    2,
-                    AeronConfig {
-                        aeron_channel: AeronChannel::Ipc,
-                        stream_id: 1001,
-                    },
-                )
+                .add_client(2, AeronConfig::Ipc { stream_id: 1001 },)
                 .unwrap(),
             JoinStatus::Ready
         );
@@ -877,13 +868,7 @@ mod tests {
         join(&mut router, 1, 1001);
         assert_eq!(
             router
-                .add_client(
-                    2,
-                    AeronConfig {
-                        aeron_channel: AeronChannel::Ipc,
-                        stream_id: 1001,
-                    },
-                )
+                .add_client(2, AeronConfig::Ipc { stream_id: 1001 },)
                 .unwrap(),
             JoinStatus::Ready
         );
@@ -955,13 +940,7 @@ mod tests {
         state.borrow_mut().never_ready = true;
         assert_eq!(
             router
-                .add_client(
-                    7,
-                    AeronConfig {
-                        aeron_channel: AeronChannel::Ipc,
-                        stream_id: 1001,
-                    },
-                )
+                .add_client(7, AeronConfig::Ipc { stream_id: 1001 },)
                 .unwrap(),
             JoinStatus::Pending
         );

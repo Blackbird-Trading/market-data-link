@@ -1,8 +1,10 @@
 use std::time::Instant;
 
 #[cfg(feature = "aeron")]
-use std::{ffi::CString, time::Duration};
+use std::{ffi::CString, net::SocketAddr, time::Duration};
 
+#[cfg(feature = "aeron")]
+use anyhow::{Context, bail};
 #[cfg(feature = "aeron")]
 use rusteron_client::{
     Aeron, AeronAsyncAddExclusivePublication, AeronCError, AeronContext, AeronExclusivePublication,
@@ -84,6 +86,17 @@ impl AeronClient {
             .poll_blocking(Duration::from_secs(5))?;
         Ok(AeronSubscriber { subscription })
     }
+
+    pub fn ephemeral_udp_subscriber(
+        &self,
+        stream_id: i32,
+    ) -> anyhow::Result<(AeronSubscriber, u16)> {
+        let subscriber = self
+            .subscriber(&AeronChannel::udp("0.0.0.0", 0), stream_id)
+            .context("failed to register wildcard Aeron UDP subscription")?;
+        let port = subscriber.resolved_udp_port()?;
+        Ok((subscriber, port))
+    }
 }
 
 #[cfg(feature = "aeron")]
@@ -130,5 +143,59 @@ impl AeronSubscriber {
 
     pub fn is_connected(&self) -> bool {
         self.subscription.is_connected()
+    }
+
+    /// Resolve the OS-assigned port of a wildcard Aeron UDP subscription.
+    ///
+    /// The subscription must have been registered with an endpoint such as
+    /// `0.0.0.0:0`. Aeron fills the wildcard port after the media driver has
+    /// created the receive endpoint.
+    pub fn resolved_udp_port(&self) -> anyhow::Result<u16> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let uri = self
+                .subscription
+                .try_resolve_channel_endpoint_port_as_string(256)
+                .context("failed to resolve Aeron UDP subscription endpoint")?;
+            if let Some(port) = resolved_endpoint_port(&uri)? {
+                return Ok(port);
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("Aeron UDP subscription endpoint still has a wildcard port after 5 seconds");
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[cfg(feature = "aeron")]
+fn resolved_endpoint_port(channel_uri: &str) -> anyhow::Result<Option<u16>> {
+    let endpoint = channel_uri
+        .split_once('?')
+        .map(|(_, params)| params)
+        .unwrap_or(channel_uri)
+        .split('|')
+        .find_map(|parameter| parameter.strip_prefix("endpoint="))
+        .context("resolved Aeron channel has no endpoint parameter")?;
+    let address: SocketAddr = endpoint
+        .parse()
+        .with_context(|| format!("invalid resolved Aeron UDP endpoint {endpoint}"))?;
+    Ok((address.port() != 0).then_some(address.port()))
+}
+
+#[cfg(all(test, feature = "aeron"))]
+mod tests {
+    use super::resolved_endpoint_port;
+
+    #[test]
+    fn extracts_resolved_wildcard_subscription_port() {
+        assert_eq!(
+            resolved_endpoint_port("aeron:udp?endpoint=0.0.0.0:40123").unwrap(),
+            Some(40123)
+        );
+        assert_eq!(
+            resolved_endpoint_port("aeron:udp?endpoint=0.0.0.0:0").unwrap(),
+            None
+        );
     }
 }

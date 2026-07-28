@@ -11,6 +11,8 @@ use futures_util::{
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
+#[cfg(feature = "aeron")]
+use crate::transport::{AeronClient, AeronSubscriber};
 use crate::{
     protocol::{
         ClientTransportConfig, ControlEvent, ControlReply, ControlReplyEnvelope, ControlRequest,
@@ -49,6 +51,9 @@ pub struct Client {
     sender: Sender,
     receiver: Receiver,
     udp_socket: Option<UdpSocket>,
+    #[cfg(feature = "aeron")]
+    aeron_subscriber: Option<AeronSubscriber>,
+    aeron_udp_port: Option<u16>,
     ref_counts: HashMap<SubscriptionKey, usize>,
     last_message_sent: Instant,
     transport_ready: bool,
@@ -71,6 +76,23 @@ impl Client {
         if config.transport.is_aeron() && !config.aeron_enabled {
             anyhow::bail!("Aeron transport selected while [aeron].enabled is false");
         }
+        #[cfg(feature = "aeron")]
+        let (aeron_subscriber, aeron_udp_port) = match &config.transport {
+            ClientTransportConfig::AeronUdp { stream_id } => {
+                let aeron = AeronClient::connect()
+                    .context("failed to connect to the Aeron media driver")?;
+                let (subscriber, port) = aeron.ephemeral_udp_subscriber(*stream_id)?;
+                (Some(subscriber), Some(port))
+            }
+            _ => (None, None),
+        };
+        #[cfg(not(feature = "aeron"))]
+        let aeron_udp_port = match &config.transport {
+            ClientTransportConfig::AeronUdp { .. } => {
+                anyhow::bail!("Aeron UDP requires the market-data-link `aeron` feature")
+            }
+            _ => None,
+        };
         let ControlEndpoint::Tcp(uri) = &config.endpoint;
         let (stream, _) = connect_async(uri)
             .await
@@ -92,6 +114,9 @@ impl Client {
             sender,
             receiver,
             udp_socket,
+            #[cfg(feature = "aeron")]
+            aeron_subscriber,
+            aeron_udp_port,
             ref_counts: HashMap::new(),
             last_message_sent: Instant::now(),
             transport_ready: false,
@@ -104,6 +129,11 @@ impl Client {
 
     pub fn config(&self) -> &ClientConfig {
         &self.config
+    }
+
+    #[cfg(feature = "aeron")]
+    pub fn take_aeron_subscriber(&mut self) -> Option<AeronSubscriber> {
+        self.aeron_subscriber.take()
     }
 
     pub fn subscription_count(&self, key: &SubscriptionKey) -> usize {
@@ -163,8 +193,7 @@ impl Client {
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         let operation = request.op;
         self.send_text(serde_json::to_string(&ControlRequestEnvelope::new(
-            Some(request_id),
-            request,
+            request_id, request,
         ))?)
         .await?;
         self.await_request_reply(request_id, operation).await
@@ -287,11 +316,10 @@ impl Client {
             ClientTransportConfig::AeronIpc { stream_id } => TransportSelection::AeronIpc {
                 stream_id: *stream_id,
             },
-            ClientTransportConfig::AeronUdp {
-                endpoint,
-                stream_id,
-            } => TransportSelection::AeronUdp {
-                endpoint: *endpoint,
+            ClientTransportConfig::AeronUdp { stream_id } => TransportSelection::AeronUdp {
+                client_port: self
+                    .aeron_udp_port
+                    .context("Aeron UDP subscription endpoint was not prepared")?,
                 stream_id: *stream_id,
             },
         };
@@ -359,7 +387,7 @@ impl Client {
                     }
                     let envelope = serde_json::from_str::<ControlReplyEnvelope>(&text)
                         .context("invalid control WebSocket message")?;
-                    if envelope.request_id != Some(request_id) {
+                    if envelope.request_id != request_id {
                         self.pending_events
                             .push_back(ClientEvent::Reply(envelope.reply));
                         continue;

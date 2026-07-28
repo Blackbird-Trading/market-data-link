@@ -412,23 +412,41 @@ where
                                         )).await?;
                                         continue;
                                     }
+                                    if matches!(
+                                        selection,
+                                        TransportSelection::AeronUdp {
+                                            client_port: 0,
+                                            ..
+                                        }
+                                    ) {
+                                        send_reply(&mut websocket, &ControlReply::error(
+                                            "Aeron UDP client port must be non-zero"
+                                        )).await?;
+                                        continue;
+                                    }
                                     let config = selection
-                                        .aeron_config()
+                                        .aeron_config(peer_ip)
                                         .expect("Aeron selection must produce an Aeron config");
                                     if let Err(error) = handler.select_aeron(client_id, config).await {
                                         send_reply(&mut websocket, &ControlReply::error(error)).await?;
                                         continue;
                                     }
                                     // Aeron is now the sole data plane. Dropping this receiver
-                                    // prevents the session from polling or buffering the legacy
+                                    // prevents the session from polling or buffering the
                                     // per-client fanout path.
                                     session.udp_outbound = None;
                                     match selection {
                                         TransportSelection::AeronIpc { stream_id } => {
                                             TransportReady::AeronIpc { stream_id }
                                         }
-                                        TransportSelection::AeronUdp { endpoint, stream_id } => {
-                                            TransportReady::AeronUdp { endpoint, stream_id }
+                                        TransportSelection::AeronUdp {
+                                            client_port,
+                                            stream_id,
+                                        } => {
+                                            TransportReady::AeronUdp {
+                                                endpoint: SocketAddr::new(peer_ip, client_port),
+                                                stream_id,
+                                            }
                                         }
                                         _ => unreachable!(),
                                     }
@@ -550,7 +568,7 @@ where
 
 async fn send_request_reply<T>(
     websocket: &mut WebSocketStream<T>,
-    request_id: Option<u64>,
+    request_id: u64,
     reply: &ControlReply,
 ) -> Result<()>
 where

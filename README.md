@@ -89,8 +89,8 @@ Success reply:
 }
 ```
 
-`request_id` is optional for compatibility with raw clients. `Client`
-always supplies it and waits for the matching reply. The operations are
+`request_id` is required. `Client` supplies it and waits for the matching
+reply. The operations are
 `subscribe`, `unsubscribe`, and `refetch_bbo`.
 
 ### Data-plane negotiation
@@ -101,7 +101,7 @@ always supplies it and waits for the matching reply. The operations are
 pub enum ClientTransportConfig {
     Udp,
     AeronIpc { stream_id: i32 },
-    AeronUdp { endpoint: SocketAddr, stream_id: i32 },
+    AeronUdp { stream_id: i32 },
 }
 ```
 
@@ -111,7 +111,11 @@ pub enum ClientTransportConfig {
   endpoint. The client connects its UDP socket to that endpoint for kernel
   source filtering. Data is server-to-client only.
 - **Aeron IPC:** the client chooses the stream ID; the channel is `aeron:ipc`.
-- **Aeron UDP:** the client supplies both endpoint and stream ID.
+- **Aeron UDP:** the client chooses the stream ID. Before opening the control
+  connection, it registers `aeron:udp?endpoint=0.0.0.0:0`, resolves the
+  OS-assigned receive port, and sends that port during negotiation. The server
+  derives the client IP from the WebSocket peer and publishes to the resulting
+  endpoint.
 
 Aeron uses `/dev/shm/aeron`. Selecting Aeron while process-level Aeron support
 is disabled fails locally in the client or returns a negotiation error from the
@@ -120,6 +124,34 @@ server.
 After Aeron becomes ready, `Server` drops the session's UDP receiver. MDP and
 FM remove that client from UDP fanout while retaining its reliable control
 events, so the shared Aeron publication is the only data path.
+
+#### Negotiated Aeron UDP endpoints
+
+Aeron UDP client configuration contains only the stream ID:
+
+```json
+{
+  "type": "aeron_udp",
+  "stream_id": 1001
+}
+```
+
+The client first registers an Aeron subscription using
+`aeron:udp?endpoint=0.0.0.0:0`, queries the subscription's resolved endpoint
+after the media driver assigns a port, and sends that port during control
+negotiation. The server derives the client IP from the WebSocket peer and
+creates its publication for `(peer_ip, resolved_port, stream_id)`.
+
+This reverses the fixed-endpoint Aeron UDP initialization order: the client
+subscription must become ready before the server publication is negotiated.
+Reconnection must create or resolve the new subscription endpoint before
+repeating negotiation.
+
+The derived-IP approach is suitable only for directly routed networks where
+the WebSocket peer IP is also reachable over UDP. NAT, WebSocket proxies,
+container address translation, and strict firewalls may require an explicitly
+advertised endpoint. Ephemeral ports also require permitting the client's UDP
+ephemeral range; a fixed endpoint can therefore remain operationally useful.
 
 ## Client API
 

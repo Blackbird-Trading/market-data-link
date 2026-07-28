@@ -1,6 +1,6 @@
 use market_data_link::{
-    ClientTransportConfig, ControlEvent, ControlOperation, ControlReply, ControlReplyEnvelope,
-    ControlRequest, ControlRequestEnvelope, StreamError, SubscriptionArg,
+    ClientTransportConfig, ControlEvent, ControlOperation, ControlReply, ControlRequest,
+    StreamError, SubscriptionArg, TransportSelection,
     codec::{
         BBO_WIRE_LEN, Bbo, CodecError, FEATURE_BBO_WIRE_LEN, FeatureBbo, MarketStatus,
         ORDER_BOOK_HEADER_LEN, ORDER_BOOK_LEVEL_LEN, OrderBook, OrderBookView,
@@ -20,47 +20,6 @@ fn canonical_feature_subscription_json() {
     let decoded: ControlRequest = serde_json::from_value(json).unwrap();
     assert_eq!(decoded.op, ControlOperation::Subscribe);
     assert_eq!(decoded, request);
-}
-
-#[test]
-fn correlated_control_messages_preserve_legacy_wire_compatibility() {
-    let request = ControlRequest::subscribe(vec![SubscriptionArg::new([101], "feature")]);
-    let correlated = ControlRequestEnvelope::new(Some(42), request.clone());
-    assert_eq!(
-        serde_json::to_value(&correlated).unwrap(),
-        serde_json::json!({
-            "request_id": 42,
-            "op": "subscribe",
-            "args": [{"id": [101], "stream": "feature"}]
-        })
-    );
-    assert_eq!(
-        serde_json::from_str::<ControlRequestEnvelope>(
-            r#"{"op":"subscribe","args":[{"id":[101],"stream":"feature"}]}"#
-        )
-        .unwrap(),
-        ControlRequestEnvelope::new(None, request.clone())
-    );
-
-    let reply = ControlReply::for_request(&request);
-    let correlated_reply = ControlReplyEnvelope::new(Some(42), reply.clone());
-    assert_eq!(
-        serde_json::to_value(&correlated_reply).unwrap()["request_id"],
-        42
-    );
-    assert_eq!(
-        serde_json::from_str::<ControlReplyEnvelope>(
-            r#"{"type":"subscribed","args":[{"id":[101],"stream":"feature"}]}"#
-        )
-        .unwrap(),
-        ControlReplyEnvelope::new(None, reply)
-    );
-}
-
-#[test]
-fn legacy_flat_feature_request_is_rejected() {
-    let result = serde_json::from_str::<ControlRequest>(r#"{"op":"subscribe","feature_id":101}"#);
-    assert!(result.is_err());
 }
 
 #[test]
@@ -93,6 +52,22 @@ fn client_transport_configuration_is_tagged_and_minimal() {
     assert_eq!(
         serde_json::to_value(ClientTransportConfig::AeronIpc { stream_id: 2001 }).unwrap(),
         serde_json::json!({"type": "aeron_ipc", "stream_id": 2001})
+    );
+    assert_eq!(
+        serde_json::to_value(ClientTransportConfig::AeronUdp { stream_id: 2002 }).unwrap(),
+        serde_json::json!({"type": "aeron_udp", "stream_id": 2002})
+    );
+    assert_eq!(
+        serde_json::to_value(TransportSelection::AeronUdp {
+            client_port: 40123,
+            stream_id: 2002,
+        })
+        .unwrap(),
+        serde_json::json!({
+            "type": "aeron_udp",
+            "client_port": 40123,
+            "stream_id": 2002
+        })
     );
 }
 

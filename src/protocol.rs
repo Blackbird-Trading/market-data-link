@@ -90,20 +90,16 @@ pub struct ControlRequest {
     pub args: Vec<SubscriptionArg>,
 }
 
-/// JSON control request with optional request/reply correlation.
-///
-/// `request_id` is omitted for legacy clients, preserving the original
-/// `{ "op": ..., "args": ... }` wire shape.
+/// JSON control request with request/reply correlation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ControlRequestEnvelope {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<u64>,
+    pub request_id: u64,
     #[serde(flatten)]
     pub request: ControlRequest,
 }
 
 impl ControlRequestEnvelope {
-    pub fn new(request_id: Option<u64>, request: ControlRequest) -> Self {
+    pub fn new(request_id: u64, request: ControlRequest) -> Self {
         Self {
             request_id,
             request,
@@ -200,18 +196,15 @@ impl ControlEvent {
 }
 
 /// JSON control reply carrying the request ID supplied by the client.
-///
-/// An absent ID serializes exactly like the legacy reply.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ControlReplyEnvelope {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<u64>,
+    pub request_id: u64,
     #[serde(flatten)]
     pub reply: ControlReply,
 }
 
 impl ControlReplyEnvelope {
-    pub fn new(request_id: Option<u64>, reply: ControlReply) -> Self {
+    pub fn new(request_id: u64, reply: ControlReply) -> Self {
         Self { request_id, reply }
     }
 }
@@ -239,41 +232,16 @@ impl ControlReply {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientTransportConfig {
     Udp,
-    AeronIpc {
-        stream_id: i32,
-    },
-    AeronUdp {
-        endpoint: SocketAddr,
-        stream_id: i32,
-    },
+    AeronIpc { stream_id: i32 },
+    AeronUdp { stream_id: i32 },
 }
 
 impl ClientTransportConfig {
     pub fn is_aeron(&self) -> bool {
         matches!(self, Self::AeronIpc { .. } | Self::AeronUdp { .. })
-    }
-
-    pub fn aeron_config(&self) -> Option<AeronConfig> {
-        match self {
-            Self::AeronIpc { stream_id } => Some(AeronConfig {
-                aeron_channel: AeronChannel::Ipc,
-                stream_id: *stream_id,
-            }),
-            Self::AeronUdp {
-                endpoint,
-                stream_id,
-            } => Some(AeronConfig {
-                aeron_channel: AeronChannel::Udp {
-                    host: endpoint.ip().to_string(),
-                    port: endpoint.port(),
-                },
-                stream_id: *stream_id,
-            }),
-            Self::Udp => None,
-        }
     }
 }
 
@@ -301,33 +269,22 @@ pub enum SelectTransportOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TransportSelection {
-    Udp {
-        client_port: u16,
-    },
-    AeronIpc {
-        stream_id: i32,
-    },
-    AeronUdp {
-        endpoint: SocketAddr,
-        stream_id: i32,
-    },
+    Udp { client_port: u16 },
+    AeronIpc { stream_id: i32 },
+    AeronUdp { client_port: u16, stream_id: i32 },
 }
 
 impl TransportSelection {
-    pub fn aeron_config(&self) -> Option<AeronConfig> {
+    pub fn aeron_config(&self, client_ip: std::net::IpAddr) -> Option<AeronConfig> {
         match self {
-            Self::AeronIpc { stream_id } => Some(AeronConfig {
-                aeron_channel: AeronChannel::Ipc,
+            Self::AeronIpc { stream_id } => Some(AeronConfig::Ipc {
                 stream_id: *stream_id,
             }),
             Self::AeronUdp {
-                endpoint,
+                client_port,
                 stream_id,
-            } => Some(AeronConfig {
-                aeron_channel: AeronChannel::Udp {
-                    host: endpoint.ip().to_string(),
-                    port: endpoint.port(),
-                },
+            } => Some(AeronConfig::Udp {
+                endpoint: SocketAddr::new(client_ip, *client_port),
                 stream_id: *stream_id,
             }),
             Self::Udp { .. } => None,
@@ -377,10 +334,16 @@ impl AeronChannel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AeronConfig {
-    pub aeron_channel: AeronChannel,
-    pub stream_id: i32,
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AeronConfig {
+    Ipc {
+        stream_id: i32,
+    },
+    Udp {
+        endpoint: SocketAddr,
+        stream_id: i32,
+    },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

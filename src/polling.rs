@@ -12,6 +12,8 @@ use crate::protocol::{
     ControlRequestEnvelope, SelectTransport, StreamError, TransportReady, TransportSelection,
 };
 use crate::transport::InboundFrame;
+#[cfg(feature = "aeron")]
+use crate::transport::{AeronClient, AeronSubscriber};
 
 #[derive(Debug)]
 pub enum PollEvent {
@@ -24,6 +26,8 @@ pub enum PollEvent {
 pub struct PollingClient {
     control: WebSocket<TcpStream>,
     udp: Option<UdpSocket>,
+    #[cfg(feature = "aeron")]
+    aeron_subscriber: Option<AeronSubscriber>,
     next_request_id: u64,
     pending_requests: HashSet<u64>,
 }
@@ -53,6 +57,23 @@ impl PollingClient {
         if transport.is_aeron() && !aeron_enabled {
             anyhow::bail!("Aeron transport selected while [aeron].enabled is false");
         }
+        #[cfg(feature = "aeron")]
+        let (aeron_subscriber, aeron_udp_port) = match &transport {
+            ClientTransportConfig::AeronUdp { stream_id } => {
+                let aeron = AeronClient::connect()
+                    .context("failed to connect to the Aeron media driver")?;
+                let (subscriber, port) = aeron.ephemeral_udp_subscriber(*stream_id)?;
+                (Some(subscriber), Some(port))
+            }
+            _ => (None, None),
+        };
+        #[cfg(not(feature = "aeron"))]
+        let aeron_udp_port = match &transport {
+            ClientTransportConfig::AeronUdp { .. } => {
+                anyhow::bail!("Aeron UDP requires the market-data-link `aeron` feature")
+            }
+            _ => None,
+        };
         let socket_target = address
             .strip_prefix("ws://")
             .or_else(|| address.strip_prefix("wss://"))
@@ -91,11 +112,9 @@ impl PollingClient {
             ClientTransportConfig::AeronIpc { stream_id } => {
                 TransportSelection::AeronIpc { stream_id }
             }
-            ClientTransportConfig::AeronUdp {
-                endpoint,
-                stream_id,
-            } => TransportSelection::AeronUdp {
-                endpoint,
+            ClientTransportConfig::AeronUdp { stream_id } => TransportSelection::AeronUdp {
+                client_port: aeron_udp_port
+                    .context("Aeron UDP subscription endpoint was not prepared")?,
                 stream_id,
             },
         };
@@ -134,6 +153,8 @@ impl PollingClient {
         Ok(Self {
             control,
             udp,
+            #[cfg(feature = "aeron")]
+            aeron_subscriber,
             next_request_id: 1,
             pending_requests: HashSet::new(),
         })
@@ -141,6 +162,11 @@ impl PollingClient {
 
     pub fn send(&mut self, message: Message) -> tungstenite::Result<()> {
         self.control.send(message)
+    }
+
+    #[cfg(feature = "aeron")]
+    pub fn take_aeron_subscriber(&mut self) -> Option<AeronSubscriber> {
+        self.aeron_subscriber.take()
     }
 
     /// Sends a correlated control request without blocking for its reply.
@@ -151,10 +177,8 @@ impl PollingClient {
         request.validate()?;
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
-        let text = serde_json::to_string(&ControlRequestEnvelope::new(
-            Some(request_id),
-            request.clone(),
-        ))?;
+        let text =
+            serde_json::to_string(&ControlRequestEnvelope::new(request_id, request.clone()))?;
         self.control.send(Message::Text(text.into()))?;
         self.pending_requests.insert(request_id);
         Ok(request_id)
@@ -200,9 +224,7 @@ impl PollingClient {
                     }
                     let envelope = serde_json::from_str::<ControlReplyEnvelope>(&text)
                         .context("invalid control WebSocket message")?;
-                    if let Some(request_id) = envelope.request_id {
-                        self.pending_requests.remove(&request_id);
-                    }
+                    self.pending_requests.remove(&envelope.request_id);
                     return Ok(Some(PollEvent::Reply(envelope)));
                 }
                 Message::Ping(payload) => {
