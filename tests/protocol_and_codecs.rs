@@ -1,8 +1,10 @@
 use market_data_link::{
-    ClientTransportConfig, ControlOperation, ControlRequest, SubscriptionArg,
+    ClientTransportConfig, ControlEvent, ControlOperation, ControlReply, ControlReplyEnvelope,
+    ControlRequest, ControlRequestEnvelope, StreamError, SubscriptionArg,
     codec::{
-        BBO_WIRE_LEN, Bbo, CodecError, FEATURE_BBO_WIRE_LEN, FeatureBbo, MarketStatus, OrderBook,
-        STATUS_WIRE_LEN, Trade, WireMessage,
+        BBO_WIRE_LEN, Bbo, CodecError, FEATURE_BBO_WIRE_LEN, FeatureBbo, MarketStatus,
+        ORDER_BOOK_HEADER_LEN, ORDER_BOOK_LEVEL_LEN, OrderBook, OrderBookView,
+        SNAPSHOT_MESSAGE_TYPE, STATUS_WIRE_LEN, Trade, WireMessage,
     },
 };
 
@@ -18,6 +20,41 @@ fn canonical_feature_subscription_json() {
     let decoded: ControlRequest = serde_json::from_value(json).unwrap();
     assert_eq!(decoded.op, ControlOperation::Subscribe);
     assert_eq!(decoded, request);
+}
+
+#[test]
+fn correlated_control_messages_preserve_legacy_wire_compatibility() {
+    let request = ControlRequest::subscribe(vec![SubscriptionArg::new([101], "feature")]);
+    let correlated = ControlRequestEnvelope::new(Some(42), request.clone());
+    assert_eq!(
+        serde_json::to_value(&correlated).unwrap(),
+        serde_json::json!({
+            "request_id": 42,
+            "op": "subscribe",
+            "args": [{"id": [101], "stream": "feature"}]
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<ControlRequestEnvelope>(
+            r#"{"op":"subscribe","args":[{"id":[101],"stream":"feature"}]}"#
+        )
+        .unwrap(),
+        ControlRequestEnvelope::new(None, request.clone())
+    );
+
+    let reply = ControlReply::for_request(&request);
+    let correlated_reply = ControlReplyEnvelope::new(Some(42), reply.clone());
+    assert_eq!(
+        serde_json::to_value(&correlated_reply).unwrap()["request_id"],
+        42
+    );
+    assert_eq!(
+        serde_json::from_str::<ControlReplyEnvelope>(
+            r#"{"type":"subscribed","args":[{"id":[101],"stream":"feature"}]}"#
+        )
+        .unwrap(),
+        ControlReplyEnvelope::new(None, reply)
+    );
 }
 
 #[test]
@@ -45,10 +82,10 @@ fn protocol_validation_rejects_empty_and_invalid_values() {
 
 #[test]
 fn client_transport_configuration_is_tagged_and_minimal() {
-    assert_eq!(
-        serde_json::to_value(ClientTransportConfig::WebSocket).unwrap(),
+    assert!(serde_json::from_value::<ClientTransportConfig>(
         serde_json::json!({"type": "websocket"})
-    );
+    )
+    .is_err());
     assert_eq!(
         serde_json::to_value(ClientTransportConfig::Udp).unwrap(),
         serde_json::json!({"type": "udp"})
@@ -57,6 +94,29 @@ fn client_transport_configuration_is_tagged_and_minimal() {
         serde_json::to_value(ClientTransportConfig::AeronIpc { stream_id: 2001 }).unwrap(),
         serde_json::json!({"type": "aeron_ipc", "stream_id": 2001})
     );
+}
+
+#[test]
+fn runtime_stream_errors_are_distinct_from_request_errors() {
+    let error = StreamError {
+        id: Some(42),
+        stream: Some("bbo".to_string()),
+        severity: 3,
+        message: "exchange disconnected".to_string(),
+        timestamp: 123,
+    };
+    let value = serde_json::to_value(ControlEvent::stream_error(error.clone())).unwrap();
+    assert_eq!(value["type"], "stream_error");
+    assert_eq!(
+        serde_json::from_value::<ControlEvent>(value)
+            .unwrap()
+            .into_stream_error(),
+        error
+    );
+    assert!(serde_json::from_value::<ControlReply>(
+        serde_json::json!({"type":"stream_error","severity":3,"message":"x","timestamp":1})
+    )
+    .is_err());
 }
 
 #[test]
@@ -115,6 +175,32 @@ fn order_book_round_trip_and_depth_validation() {
     let mut invalid = value;
     invalid.depth = 5;
     assert_eq!(invalid.encode_le().unwrap_err(), CodecError::DepthMismatch);
+}
+
+#[test]
+fn order_book_view_reuses_caller_owned_encoding_buffer() {
+    let bids = [(100.0, 2.0), (99.0, 3.0)];
+    let asks = [(101.0, 4.0), (102.0, 5.0)];
+    let view = OrderBookView {
+        message_type: SNAPSHOT_MESSAGE_TYPE,
+        depth: 2,
+        market_id: 42,
+        update_id: 9,
+        timestamp_mdp_in: 10,
+        timestamp_matching_engine: 11,
+        timestamp: 12,
+        event_id: 13,
+        timestamp_mdp_out: 14,
+        bids: &bids,
+        asks: &asks,
+    };
+    let mut buffer = Vec::with_capacity(ORDER_BOOK_HEADER_LEN + 2 * ORDER_BOOK_LEVEL_LEN);
+    view.encode_le_into(&mut buffer).unwrap();
+    let allocation = buffer.as_ptr();
+    view.encode_le_into(&mut buffer).unwrap();
+
+    assert_eq!(buffer.as_ptr(), allocation);
+    assert_eq!(OrderBook::decode_le(&buffer).unwrap().bids, bids);
 }
 
 #[test]

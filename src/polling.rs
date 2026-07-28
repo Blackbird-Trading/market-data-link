@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::{SocketAddr, TcpStream, UdpSocket},
     time::Duration,
 };
@@ -6,22 +7,31 @@ use std::{
 use anyhow::{Context, Result};
 use tungstenite::{Message, WebSocket};
 
-use crate::FrameFilter;
 use crate::protocol::{
-    ClientTransportConfig, ControlReply, ControlRequest, SelectTransport, TransportReady,
-    TransportSelection,
+    ClientTransportConfig, ControlEvent, ControlReply, ControlReplyEnvelope, ControlRequest,
+    ControlRequestEnvelope, SelectTransport, StreamError, TransportReady, TransportSelection,
 };
+use crate::transport::InboundFrame;
 
-pub struct BlockingLink {
-    control: WebSocket<TcpStream>,
-    udp: Option<UdpSocket>,
-    frame_filter: FrameFilter,
+#[derive(Debug)]
+pub enum PollEvent {
+    Data(InboundFrame),
+    Reply(ControlReplyEnvelope),
+    StreamError(StreamError),
+    Keepalive,
 }
 
-impl std::fmt::Debug for BlockingLink {
+pub struct PollingClient {
+    control: WebSocket<TcpStream>,
+    udp: Option<UdpSocket>,
+    next_request_id: u64,
+    pending_requests: HashSet<u64>,
+}
+
+impl std::fmt::Debug for PollingClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("BlockingLink")
+            .debug_struct("PollingClient")
             .field(
                 "udp",
                 &self
@@ -33,7 +43,7 @@ impl std::fmt::Debug for BlockingLink {
     }
 }
 
-impl BlockingLink {
+impl PollingClient {
     pub fn connect_tcp(
         address: &str,
         timeout: Duration,
@@ -71,7 +81,6 @@ impl BlockingLink {
         };
 
         let selection = match transport {
-            ClientTransportConfig::WebSocket => TransportSelection::WebSocket,
             ClientTransportConfig::Udp => TransportSelection::Udp {
                 client_port: udp
                     .as_ref()
@@ -125,48 +134,87 @@ impl BlockingLink {
         Ok(Self {
             control,
             udp,
-            frame_filter: FrameFilter::default(),
+            next_request_id: 1,
+            pending_requests: HashSet::new(),
         })
     }
 
     pub fn send(&mut self, message: Message) -> tungstenite::Result<()> {
-        let request = match &message {
-            Message::Text(text) => serde_json::from_str::<ControlRequest>(text).ok(),
-            _ => None,
-        };
-        self.control.send(message)?;
-        if let Some(request) = request {
-            self.frame_filter.apply(&request);
-        }
-        Ok(())
+        self.control.send(message)
+    }
+
+    /// Sends a correlated control request without blocking for its reply.
+    ///
+    /// The request remains pending until [`Self::poll`] returns its correlated
+    /// reply.
+    pub fn send_request(&mut self, request: ControlRequest) -> Result<u64> {
+        request.validate()?;
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        let text = serde_json::to_string(&ControlRequestEnvelope::new(
+            Some(request_id),
+            request.clone(),
+        ))?;
+        self.control.send(Message::Text(text.into()))?;
+        self.pending_requests.insert(request_id);
+        Ok(request_id)
     }
 
     pub fn flush(&mut self) -> tungstenite::Result<()> {
         self.control.flush()
     }
 
-    pub fn read(&mut self) -> tungstenite::Result<Message> {
+    pub fn poll(&mut self) -> Result<Option<PollEvent>> {
         if let Some(socket) = &self.udp {
             let mut bytes = vec![0; 65_535];
             match socket.recv(&mut bytes) {
                 Ok(size) => {
                     bytes.truncate(size);
-                    if self.frame_filter.accepts(&bytes) {
-                        return Ok(Message::Binary(bytes.into()));
-                    }
+                    return Ok(Some(PollEvent::Data(InboundFrame {
+                        bytes,
+                        received_at: std::time::Instant::now(),
+                    })));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(tungstenite::Error::Io(error)),
+                Err(error) => return Err(error.into()),
             }
         }
         loop {
-            let message = self.control.read()?;
-            if let Message::Binary(bytes) = &message
-                && !self.frame_filter.accepts(bytes)
-            {
-                continue;
+            let message = match self.control.read() {
+                Ok(message) => message,
+                Err(tungstenite::Error::Io(error))
+                    if error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            };
+            match message {
+                Message::Binary(_) => {
+                    anyhow::bail!("binary frames are not allowed on the control WebSocket")
+                }
+                Message::Text(text) => {
+                    if let Ok(event) = serde_json::from_str::<ControlEvent>(&text) {
+                        let error = event.into_stream_error();
+                        return Ok(Some(PollEvent::StreamError(error)));
+                    }
+                    let envelope = serde_json::from_str::<ControlReplyEnvelope>(&text)
+                        .context("invalid control WebSocket message")?;
+                    if let Some(request_id) = envelope.request_id {
+                        self.pending_requests.remove(&request_id);
+                    }
+                    return Ok(Some(PollEvent::Reply(envelope)));
+                }
+                Message::Ping(payload) => {
+                    self.control.send(Message::Pong(payload))?;
+                    return Ok(Some(PollEvent::Keepalive));
+                }
+                Message::Pong(_) => return Ok(Some(PollEvent::Keepalive)),
+                Message::Close(frame) => {
+                    anyhow::bail!("control WebSocket closed: {frame:?}")
+                }
+                _ => continue,
             }
-            return Ok(message);
         }
     }
 

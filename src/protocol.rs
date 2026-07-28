@@ -15,6 +15,8 @@ pub enum ControlOperation {
 pub struct SubscriptionArg {
     pub id: Vec<i32>,
     pub stream: String,
+    /// Optional service-level hint. Shared UDP/Aeron infrastructure validates
+    /// and forwards this value but does not apply any noise filtering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub noise_filter_bps: Option<f64>,
 }
@@ -88,6 +90,27 @@ pub struct ControlRequest {
     pub args: Vec<SubscriptionArg>,
 }
 
+/// JSON control request with optional request/reply correlation.
+///
+/// `request_id` is omitted for legacy clients, preserving the original
+/// `{ "op": ..., "args": ... }` wire shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ControlRequestEnvelope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
+    #[serde(flatten)]
+    pub request: ControlRequest,
+}
+
+impl ControlRequestEnvelope {
+    pub fn new(request_id: Option<u64>, request: ControlRequest) -> Self {
+        Self {
+            request_id,
+            request,
+        }
+    }
+}
+
 impl ControlRequest {
     pub fn subscribe(args: Vec<SubscriptionArg>) -> Self {
         Self {
@@ -140,6 +163,59 @@ pub enum ControlReply {
     Error { message: String },
 }
 
+/// An asynchronous failure affecting a data stream.
+///
+/// Unlike [`ControlReply::Error`], this is not a response to a control
+/// request and therefore has no request ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
+    pub severity: u8,
+    pub message: String,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlEvent {
+    StreamError {
+        #[serde(flatten)]
+        error: StreamError,
+    },
+}
+
+impl ControlEvent {
+    pub fn stream_error(error: StreamError) -> Self {
+        Self::StreamError { error }
+    }
+
+    pub fn into_stream_error(self) -> StreamError {
+        match self {
+            Self::StreamError { error } => error,
+        }
+    }
+}
+
+/// JSON control reply carrying the request ID supplied by the client.
+///
+/// An absent ID serializes exactly like the legacy reply.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ControlReplyEnvelope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
+    #[serde(flatten)]
+    pub reply: ControlReply,
+}
+
+impl ControlReplyEnvelope {
+    pub fn new(request_id: Option<u64>, reply: ControlReply) -> Self {
+        Self { request_id, reply }
+    }
+}
+
 impl ControlReply {
     pub fn for_request(request: &ControlRequest) -> Self {
         match request.op {
@@ -165,8 +241,6 @@ impl ControlReply {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientTransportConfig {
-    #[serde(rename = "websocket")]
-    WebSocket,
     Udp,
     AeronIpc {
         stream_id: i32,
@@ -198,7 +272,7 @@ impl ClientTransportConfig {
                 },
                 stream_id: *stream_id,
             }),
-            Self::WebSocket | Self::Udp => None,
+            Self::Udp => None,
         }
     }
 }
@@ -227,8 +301,6 @@ pub enum SelectTransportOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TransportSelection {
-    #[serde(rename = "websocket")]
-    WebSocket,
     Udp {
         client_port: u16,
     },
@@ -258,7 +330,7 @@ impl TransportSelection {
                 },
                 stream_id: *stream_id,
             }),
-            Self::WebSocket | Self::Udp { .. } => None,
+            Self::Udp { .. } => None,
         }
     }
 }
@@ -266,8 +338,6 @@ impl TransportSelection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TransportReady {
-    #[serde(rename = "websocket")]
-    WebSocket,
     Udp {
         server_address: SocketAddr,
     },

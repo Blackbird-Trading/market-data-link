@@ -20,20 +20,21 @@ use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
 use crate::protocol::{
-    AeronConfig, ControlOperation, ControlReply, ControlRequest, SelectTransport, SubscriptionKey,
+    AeronConfig, ControlEvent, ControlOperation, ControlReply, ControlReplyEnvelope,
+    ControlRequest, ControlRequestEnvelope, SelectTransport, StreamError, SubscriptionKey,
     TransportReady, TransportSelection,
 };
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
-pub struct LinkServerConfig {
+pub struct ServerConfig {
     pub tcp_bind_addr: String,
     pub aeron_enabled: bool,
     pub active_client_log_interval: Duration,
 }
 
-impl LinkServerConfig {
+impl ServerConfig {
     pub fn tcp(tcp_bind_addr: impl Into<String>) -> Self {
         Self {
             tcp_bind_addr: tcp_bind_addr.into(),
@@ -43,17 +44,17 @@ impl LinkServerConfig {
     }
 }
 
-pub struct BackendSession {
+pub struct SessionChannels {
     pub client_id: u64,
-    pub outbound: Option<mpsc::Receiver<Vec<u8>>>,
+    pub udp_outbound: Option<mpsc::Receiver<Vec<u8>>>,
     pub control: Option<mpsc::Receiver<SessionControl>>,
 }
 
-impl BackendSession {
+impl SessionChannels {
     pub fn control_only(client_id: u64) -> Self {
         Self {
             client_id,
-            outbound: None,
+            udp_outbound: None,
             control: None,
         }
     }
@@ -61,7 +62,7 @@ impl BackendSession {
 
 #[derive(Debug)]
 pub enum SessionControl {
-    Error(String),
+    StreamError(StreamError),
     Close,
 }
 
@@ -74,21 +75,23 @@ pub struct PublishReport {
 
 struct RoutedSession {
     subscriptions: HashSet<SubscriptionKey>,
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: Option<mpsc::Sender<Vec<u8>>>,
+    control: mpsc::Sender<SessionControl>,
 }
 
 /// A reusable per-session subscription table and bounded output router.
 ///
-/// Backends remain responsible for domain validation. Once a request succeeds,
+/// Handlers remain responsible for domain validation. Once a request succeeds,
 /// they apply it here and publish frames by their `(id, stream)` routing key.
 #[derive(Clone, Default)]
-pub struct SubscriptionRouter {
+pub struct ClientRouter {
     sessions: Arc<StdRwLock<HashMap<u64, RoutedSession>>>,
 }
 
-impl SubscriptionRouter {
-    pub fn connect(&self, client_id: u64, capacity: usize) -> BackendSession {
-        let (sender, outbound) = mpsc::channel(capacity);
+impl ClientRouter {
+    pub fn register_client(&self, client_id: u64, capacity: usize) -> SessionChannels {
+        let (sender, udp_outbound) = mpsc::channel(capacity);
+        let (control_sender, control) = mpsc::channel(capacity);
         self.sessions
             .write()
             .expect("subscription router lock poisoned")
@@ -96,17 +99,18 @@ impl SubscriptionRouter {
                 client_id,
                 RoutedSession {
                     subscriptions: HashSet::new(),
-                    sender,
+                    sender: Some(sender),
+                    control: control_sender,
                 },
             );
-        BackendSession {
+        SessionChannels {
             client_id,
-            outbound: Some(outbound),
-            control: None,
+            udp_outbound: Some(udp_outbound),
+            control: Some(control),
         }
     }
 
-    pub fn apply(&self, client_id: u64, request: &ControlRequest) -> Result<()> {
+    pub fn update_subscriptions(&self, client_id: u64, request: &ControlRequest) -> Result<()> {
         let mut sessions = self
             .sessions
             .write()
@@ -126,14 +130,27 @@ impl SubscriptionRouter {
         Ok(())
     }
 
-    pub fn disconnect(&self, client_id: u64) {
+    pub fn remove_client(&self, client_id: u64) {
         self.sessions
             .write()
             .expect("subscription router lock poisoned")
             .remove(&client_id);
     }
 
-    pub fn publish(&self, key: &SubscriptionKey, bytes: &[u8]) -> PublishReport {
+    /// Disables UDP delivery while retaining control-event routing and the
+    /// client's confirmed subscription set.
+    pub fn disable_udp(&self, client_id: u64) {
+        if let Some(session) = self
+            .sessions
+            .write()
+            .expect("subscription router lock poisoned")
+            .get_mut(&client_id)
+        {
+            session.sender = None;
+        }
+    }
+
+    pub fn send_data(&self, key: &SubscriptionKey, bytes: &[u8]) -> PublishReport {
         let sessions = self
             .sessions
             .read()
@@ -148,7 +165,10 @@ impl SubscriptionRouter {
             {
                 continue;
             }
-            match session.sender.try_send(bytes.to_vec()) {
+            let Some(sender) = &session.sender else {
+                continue;
+            };
+            match sender.try_send(bytes.to_vec()) {
                 Ok(()) => report.delivered += 1,
                 Err(mpsc::error::TrySendError::Full(_)) => report.full += 1,
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -176,26 +196,87 @@ impl SubscriptionRouter {
             .expect("subscription router lock poisoned")
             .len()
     }
+
+    /// Publishes a reliable control-plane error to matching subscribers.
+    ///
+    /// An incomplete scope is global. A full control queue removes the
+    /// session so the server observes channel closure and disconnects it
+    /// instead of silently losing the error.
+    pub fn send_error(&self, error: &StreamError) -> PublishReport {
+        let sessions = self
+            .sessions
+            .read()
+            .expect("subscription router lock poisoned");
+        let mut report = PublishReport::default();
+        let mut closed = Vec::new();
+        for (client_id, session) in sessions.iter() {
+            let matches = match (error.id, error.stream.as_deref()) {
+                (Some(id), Some(stream)) => session
+                    .subscriptions
+                    .iter()
+                    .any(|subscription| subscription.id == id && subscription.stream == stream),
+                _ => true,
+            };
+            if !matches {
+                continue;
+            }
+            match session
+                .control
+                .try_send(SessionControl::StreamError(error.clone()))
+            {
+                Ok(()) => report.delivered += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    report.full += 1;
+                    closed.push(*client_id);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    report.closed += 1;
+                    closed.push(*client_id);
+                }
+            }
+        }
+        drop(sessions);
+        if !closed.is_empty() {
+            let mut sessions = self
+                .sessions
+                .write()
+                .expect("subscription router lock poisoned");
+            for client_id in closed {
+                sessions.remove(&client_id);
+            }
+        }
+        report
+    }
 }
 
 #[async_trait]
-pub trait SubscriptionBackend: Clone + Send + Sync + 'static {
-    async fn connect(&self, suggested_client_id: u64) -> Result<BackendSession>;
-    async fn request(&self, client_id: u64, request: ControlRequest) -> Result<ControlReply>;
-    async fn configure_aeron(&self, _client_id: u64, _config: AeronConfig) -> Result<()> {
-        anyhow::bail!("Aeron is not supported by this backend")
+pub trait ServerHandler: Clone + Send + Sync + 'static {
+    async fn open_session(&self, suggested_client_id: u64) -> Result<SessionChannels>;
+    /// Applies request arguments in handler-defined order.
+    ///
+    /// Handlers that process multi-argument requests sequentially may have
+    /// applied earlier arguments when a later one fails. Callers requiring an
+    /// exact remote state must reconnect and resubscribe their confirmed set.
+    async fn handle_request(
+        &self,
+        client_id: u64,
+        request: ControlRequest,
+    ) -> Result<ControlReply>;
+    async fn select_aeron(&self, _client_id: u64, _config: AeronConfig) -> Result<()> {
+        anyhow::bail!("Aeron is not supported by this server handler")
     }
-    async fn disconnect(&self, client_id: u64);
+    /// Completes idempotent service cleanup for a disconnected client.
+    async fn close_session(&self, client_id: u64) -> Result<()>;
 }
 
-pub struct LinkServer<B> {
-    config: LinkServerConfig,
-    backend: B,
+pub struct Server<H> {
+    config: ServerConfig,
+    handler: H,
 }
 
-impl<B: SubscriptionBackend> LinkServer<B> {
-    pub fn new(config: LinkServerConfig, backend: B) -> Self {
-        Self { config, backend }
+impl<H: ServerHandler> Server<H> {
+    pub fn new(config: ServerConfig, handler: H) -> Self {
+        Self { config, handler }
     }
 
     pub async fn run(self) -> Result<()> {
@@ -246,7 +327,7 @@ impl<B: SubscriptionBackend> LinkServer<B> {
     ) where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let backend = self.backend.clone();
+        let handler = self.handler.clone();
         let aeron_enabled = self.config.aeron_enabled;
         tokio::spawn(async move {
             let suggested_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
@@ -256,7 +337,7 @@ impl<B: SubscriptionBackend> LinkServer<B> {
                 peer_ip,
                 local_ip,
                 udp_socket,
-                backend.clone(),
+                handler.clone(),
                 aeron_enabled,
                 suggested_id,
                 active_clients.clone(),
@@ -270,28 +351,27 @@ impl<B: SubscriptionBackend> LinkServer<B> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_session<T, B>(
+async fn run_session<T, H>(
     stream: T,
     peer: String,
     peer_ip: IpAddr,
     local_ip: IpAddr,
     udp_socket: Arc<OnceCell<Arc<UdpSocket>>>,
-    backend: B,
+    handler: H,
     aeron_enabled: bool,
     suggested_id: u64,
     active_clients: Arc<RwLock<BTreeMap<u64, String>>>,
 ) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
-    B: SubscriptionBackend,
+    H: ServerHandler,
 {
     let mut websocket = accept_async(stream).await?;
-    let mut session = backend.connect(suggested_id).await?;
+    let mut session = handler.open_session(suggested_id).await?;
     let client_id = session.client_id;
     active_clients.write().await.insert(client_id, peer.clone());
     info!(client_id, %peer, "link client connected");
     let mut udp_target = None;
-    let mut external_data_plane = false;
     let mut transport_ready = false;
 
     let result: Result<()> = async {
@@ -307,10 +387,6 @@ where
                                 continue;
                             }
                             let ready = match selection.transport {
-                                TransportSelection::WebSocket => {
-                                    external_data_plane = false;
-                                    TransportReady::WebSocket
-                                }
                                 TransportSelection::Udp { client_port } => {
                                     if client_port == 0 {
                                         send_reply(&mut websocket, &ControlReply::error("UDP client port must be non-zero")).await?;
@@ -324,7 +400,6 @@ where
                                         })
                                         .await?;
                                     udp_target = Some(SocketAddr::new(peer_ip, client_port));
-                                    external_data_plane = false;
                                     TransportReady::Udp {
                                         server_address: SocketAddr::new(
                                             local_ip,
@@ -343,11 +418,14 @@ where
                                     let config = selection
                                         .aeron_config()
                                         .expect("Aeron selection must produce an Aeron config");
-                                    if let Err(error) = backend.configure_aeron(client_id, config).await {
+                                    if let Err(error) = handler.select_aeron(client_id, config).await {
                                         send_reply(&mut websocket, &ControlReply::error(error)).await?;
                                         continue;
                                     }
-                                    external_data_plane = true;
+                                    // Aeron is now the sole data plane. Dropping this receiver
+                                    // prevents the session from polling or buffering the legacy
+                                    // per-client fanout path.
+                                    session.udp_outbound = None;
                                     match selection {
                                         TransportSelection::AeronIpc { stream_id } => {
                                             TransportReady::AeronIpc { stream_id }
@@ -367,31 +445,44 @@ where
                             .await?;
                             continue;
                         }
-                        let request = match serde_json::from_str::<ControlRequest>(&text) {
-                            Ok(request) => request,
+                        let envelope = match serde_json::from_str::<ControlRequestEnvelope>(&text) {
+                            Ok(envelope) => envelope,
                             Err(error) => {
                                 send_reply(&mut websocket, &ControlReply::error(format!("invalid control request: {error}"))).await?;
                                 continue;
                             }
                         };
+                        let request_id = envelope.request_id;
+                        let request = envelope.request;
                         if let Err(error) = request.validate() {
-                            send_reply(&mut websocket, &ControlReply::error(error)).await?;
+                            send_request_reply(
+                                &mut websocket,
+                                request_id,
+                                &ControlReply::error(error),
+                            )
+                            .await?;
                             continue;
                         }
                         if !transport_ready {
-                            send_reply(&mut websocket, &ControlReply::error(
-                                "select_transport must succeed before subscriptions"
-                            )).await?;
+                            send_request_reply(
+                                &mut websocket,
+                                request_id,
+                                &ControlReply::error(
+                                    "select_transport must succeed before subscriptions"
+                                ),
+                            )
+                            .await?;
                             continue;
                         }
-                        let reply = backend
-                            .request(client_id, request)
+                        let reply = handler
+                            .handle_request(client_id, request)
                             .await
                             .unwrap_or_else(ControlReply::error);
-                        send_reply(&mut websocket, &reply).await?;
+                        send_request_reply(&mut websocket, request_id, &reply).await?;
                     }
                     Message::Binary(_) => {
                         send_reply(&mut websocket, &ControlReply::error("binary client messages are unsupported")).await?;
+                        break;
                     }
                     Message::Ping(payload) => websocket.send(Message::Pong(payload)).await?,
                     Message::Pong(_) => {}
@@ -399,20 +490,20 @@ where
                     _ => {}
                 }
             }
-            data = recv_optional(&mut session.outbound), if session.outbound.is_some() => {
+            data = recv_optional(&mut session.udp_outbound),
+                if session.udp_outbound.is_some() && udp_target.is_some() => {
                 let Some(data) = data else { break };
-                if external_data_plane {
-                    continue;
-                } else if let (Some(socket), Some(target)) = (udp_socket.get(), udp_target) {
+                if let (Some(socket), Some(target)) = (udp_socket.get(), udp_target) {
                     socket.send_to(&data, target).await?;
-                } else {
-                    websocket.send(Message::Binary(data.into())).await?;
                 }
             }
             control = recv_optional(&mut session.control), if session.control.is_some() => {
                 match control {
-                    Some(SessionControl::Error(message)) => {
-                        send_reply(&mut websocket, &ControlReply::error(message)).await?;
+                    Some(SessionControl::StreamError(error)) => {
+                        send_event(
+                            &mut websocket,
+                            &ControlEvent::stream_error(error),
+                        ).await?;
                     }
                     Some(SessionControl::Close) | None => break,
                 }
@@ -424,9 +515,23 @@ where
     .await;
 
     active_clients.write().await.remove(&client_id);
-    backend.disconnect(client_id).await;
+    let disconnect_result = handler.close_session(client_id).await;
     debug!(client_id, %peer, "link client disconnected");
-    result
+    match (result, disconnect_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.context("server handler cleanup failed")),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+async fn send_event<T>(websocket: &mut WebSocketStream<T>, event: &ControlEvent) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    websocket
+        .send(Message::Text(serde_json::to_string(event)?.into()))
+        .await?;
+    Ok(())
 }
 
 async fn recv_optional<T>(receiver: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
@@ -442,6 +547,22 @@ where
 {
     websocket
         .send(Message::Text(serde_json::to_string(reply)?.into()))
+        .await?;
+    Ok(())
+}
+
+async fn send_request_reply<T>(
+    websocket: &mut WebSocketStream<T>,
+    request_id: Option<u64>,
+    reply: &ControlReply,
+) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    websocket
+        .send(Message::Text(
+            serde_json::to_string(&ControlReplyEnvelope::new(request_id, reply.clone()))?.into(),
+        ))
         .await?;
     Ok(())
 }

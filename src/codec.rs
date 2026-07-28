@@ -111,8 +111,23 @@ pub struct OrderBook {
     pub asks: Vec<(f64, f64)>,
 }
 
-impl OrderBook {
-    pub fn encode_le(&self) -> Result<Vec<u8>, CodecError> {
+#[derive(Debug, Clone, Copy)]
+pub struct OrderBookView<'a> {
+    pub message_type: u8,
+    pub depth: u16,
+    pub market_id: i32,
+    pub update_id: i64,
+    pub timestamp_mdp_in: i64,
+    pub timestamp_matching_engine: i64,
+    pub timestamp: i64,
+    pub event_id: u64,
+    pub timestamp_mdp_out: i64,
+    pub bids: &'a [(f64, f64)],
+    pub asks: &'a [(f64, f64)],
+}
+
+impl OrderBookView<'_> {
+    pub fn encode_le_into<'a>(&self, bytes: &'a mut Vec<u8>) -> Result<&'a [u8], CodecError> {
         if !matches!(
             self.message_type,
             SNAPSHOT_MESSAGE_TYPE | DEPTH_UPDATE_MESSAGE_TYPE
@@ -122,24 +137,49 @@ impl OrderBook {
         if self.bids.len() != self.depth as usize || self.asks.len() != self.depth as usize {
             return Err(CodecError::DepthMismatch);
         }
-        let mut bytes = vec![0; ORDER_BOOK_HEADER_LEN + self.depth as usize * ORDER_BOOK_LEVEL_LEN];
+        bytes.resize(
+            ORDER_BOOK_HEADER_LEN + self.depth as usize * ORDER_BOOK_LEVEL_LEN,
+            0,
+        );
         bytes[0] = self.message_type;
-        put(&mut bytes, 1, self.depth.to_le_bytes());
-        put(&mut bytes, 3, self.market_id.to_le_bytes());
-        put(&mut bytes, 7, self.update_id.to_le_bytes());
-        put(&mut bytes, 15, self.timestamp_mdp_in.to_le_bytes());
-        put(&mut bytes, 23, self.timestamp_matching_engine.to_le_bytes());
-        put(&mut bytes, 31, self.timestamp.to_le_bytes());
-        put(&mut bytes, 39, self.event_id.to_le_bytes());
-        put(&mut bytes, 47, self.timestamp_mdp_out.to_le_bytes());
+        put(bytes, 1, self.depth.to_le_bytes());
+        put(bytes, 3, self.market_id.to_le_bytes());
+        put(bytes, 7, self.update_id.to_le_bytes());
+        put(bytes, 15, self.timestamp_mdp_in.to_le_bytes());
+        put(bytes, 23, self.timestamp_matching_engine.to_le_bytes());
+        put(bytes, 31, self.timestamp.to_le_bytes());
+        put(bytes, 39, self.event_id.to_le_bytes());
+        put(bytes, 47, self.timestamp_mdp_out.to_le_bytes());
         let mut offset = ORDER_BOOK_HEADER_LEN;
-        for (bid, ask) in self.bids.iter().zip(&self.asks) {
-            put(&mut bytes, offset, bid.0.to_le_bytes());
-            put(&mut bytes, offset + 8, bid.1.to_le_bytes());
-            put(&mut bytes, offset + 16, ask.0.to_le_bytes());
-            put(&mut bytes, offset + 24, ask.1.to_le_bytes());
+        for (bid, ask) in self.bids.iter().zip(self.asks) {
+            put(bytes, offset, bid.0.to_le_bytes());
+            put(bytes, offset + 8, bid.1.to_le_bytes());
+            put(bytes, offset + 16, ask.0.to_le_bytes());
+            put(bytes, offset + 24, ask.1.to_le_bytes());
             offset += ORDER_BOOK_LEVEL_LEN;
         }
+        Ok(bytes)
+    }
+}
+
+impl OrderBook {
+    pub fn encode_le(&self) -> Result<Vec<u8>, CodecError> {
+        let mut bytes =
+            Vec::with_capacity(ORDER_BOOK_HEADER_LEN + self.depth as usize * ORDER_BOOK_LEVEL_LEN);
+        OrderBookView {
+            message_type: self.message_type,
+            depth: self.depth,
+            market_id: self.market_id,
+            update_id: self.update_id,
+            timestamp_mdp_in: self.timestamp_mdp_in,
+            timestamp_matching_engine: self.timestamp_matching_engine,
+            timestamp: self.timestamp,
+            event_id: self.event_id,
+            timestamp_mdp_out: self.timestamp_mdp_out,
+            bids: &self.bids,
+            asks: &self.asks,
+        }
+        .encode_le_into(&mut bytes)?;
         Ok(bytes)
     }
 

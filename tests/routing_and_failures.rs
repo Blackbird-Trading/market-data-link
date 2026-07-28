@@ -1,31 +1,68 @@
 use market_data_link::{
-    ControlRequest, FrameFilter, SubscriptionArg, SubscriptionKey, SubscriptionRouter,
+    ClientRouter, ControlRequest, SessionControl, StreamError, SubscriptionArg, SubscriptionKey,
     codec::{Bbo, FeatureBbo, MarketStatus, WireMessage},
 };
 
 #[tokio::test]
 async fn router_reports_backpressure_and_closed_channels() {
-    let router = SubscriptionRouter::default();
-    let mut session = router.connect(1, 1);
+    let router = ClientRouter::default();
+    let mut session = router.register_client(1, 1);
     router
-        .apply(
+        .update_subscriptions(
             1,
             &ControlRequest::subscribe(vec![SubscriptionArg::new([42], "bbo")]),
         )
         .unwrap();
     let key = SubscriptionKey::new(42, "bbo");
 
-    assert_eq!(router.publish(&key, &[1]).delivered, 1);
-    assert_eq!(router.publish(&key, &[2]).full, 1);
+    assert_eq!(router.send_data(&key, &[1]).delivered, 1);
+    assert_eq!(router.send_data(&key, &[2]).full, 1);
     assert_eq!(
-        session.outbound.as_mut().unwrap().recv().await,
+        session.udp_outbound.as_mut().unwrap().recv().await,
         Some(vec![1])
     );
 
-    let outbound = session.outbound.take().unwrap();
+    let outbound = session.udp_outbound.take().unwrap();
     drop(outbound);
-    assert_eq!(router.publish(&key, &[3]).closed, 1);
+    assert_eq!(router.send_data(&key, &[3]).closed, 1);
     assert_eq!(router.session_count(), 0);
+}
+
+#[tokio::test]
+async fn stream_errors_are_scoped_and_control_backpressure_removes_session() {
+    let router = ClientRouter::default();
+    let mut matching = router.register_client(1, 1);
+    let mut other = router.register_client(2, 1);
+    router
+        .update_subscriptions(
+            1,
+            &ControlRequest::subscribe(vec![SubscriptionArg::new([42], "bbo")]),
+        )
+        .unwrap();
+    router
+        .update_subscriptions(
+            2,
+            &ControlRequest::subscribe(vec![SubscriptionArg::new([43], "bbo")]),
+        )
+        .unwrap();
+    let error = StreamError {
+        id: Some(42),
+        stream: Some("bbo".to_string()),
+        severity: 1,
+        message: "down".to_string(),
+        timestamp: 10,
+    };
+    assert_eq!(router.send_error(&error).delivered, 1);
+    assert!(matches!(
+        matching.control.as_mut().unwrap().recv().await,
+        Some(SessionControl::StreamError(received)) if received == error
+    ));
+    assert!(other.control.as_mut().unwrap().try_recv().is_err());
+
+    assert_eq!(router.send_error(&error).delivered, 1);
+    let report = router.send_error(&error);
+    assert_eq!(report.full, 1);
+    assert_eq!(router.session_count(), 1);
 }
 
 #[test]
@@ -37,23 +74,15 @@ fn mock_market_status_resets_fm_and_propagates_neutral_feature_to_te() {
         event_id: 11,
         ts_mono_mdp_out: 12,
     };
-    let mut fm_filter = FrameFilter::default();
-    fm_filter.apply(&ControlRequest::subscribe(vec![SubscriptionArg::new(
-        [42],
-        "bbo",
-    )]));
-    assert!(fm_filter.accepts(&status.encode_le()));
+    assert!(matches!(
+        WireMessage::decode(&status.encode_le()).unwrap(),
+        WireMessage::Status(decoded) if decoded.market_id == 42
+    ));
 
     let neutral = FeatureBbo::neutral_for_status(101, &status, 13, 14, 15, 16);
     assert_eq!((neutral.bid, neutral.ask), (1.0, 1.0));
 
-    let mut te_filter = FrameFilter::default();
-    te_filter.apply(&ControlRequest::subscribe(vec![SubscriptionArg::new(
-        [101],
-        "feature",
-    )]));
     let bytes = neutral.encode_le();
-    assert!(te_filter.accepts(&bytes));
     assert!(matches!(
         WireMessage::decode(&bytes).unwrap(),
         WireMessage::FeatureBbo(feature)
@@ -66,10 +95,10 @@ fn mock_market_status_resets_fm_and_propagates_neutral_feature_to_te() {
 
 #[tokio::test]
 async fn disconnect_removes_all_session_subscriptions() {
-    let router = SubscriptionRouter::default();
-    let _session = router.connect(9, 4);
+    let router = ClientRouter::default();
+    let _session = router.register_client(9, 4);
     router
-        .apply(
+        .update_subscriptions(
             9,
             &ControlRequest::subscribe(vec![
                 SubscriptionArg::new([1], "bbo"),
@@ -77,28 +106,29 @@ async fn disconnect_removes_all_session_subscriptions() {
             ]),
         )
         .unwrap();
-    router.disconnect(9);
+    router.remove_client(9);
+    router.remove_client(9);
 
     assert_eq!(router.session_count(), 0);
     assert_eq!(
-        router.publish(&SubscriptionKey::new(1, "bbo"), &[1]),
+        router.send_data(&SubscriptionKey::new(1, "bbo"), &[1]),
         Default::default()
     );
 }
 
 #[tokio::test]
 async fn mock_mdp_to_fm_and_fm_to_te_routes_keep_streams_separate() {
-    let router = SubscriptionRouter::default();
-    let mut fm = router.connect(1, 4);
-    let mut te = router.connect(2, 4);
+    let router = ClientRouter::default();
+    let mut fm = router.register_client(1, 4);
+    let mut te = router.register_client(2, 4);
     router
-        .apply(
+        .update_subscriptions(
             1,
             &ControlRequest::subscribe(vec![SubscriptionArg::new([42], "bbo")]),
         )
         .unwrap();
     router
-        .apply(
+        .update_subscriptions(
             2,
             &ControlRequest::subscribe(vec![SubscriptionArg::new([101], "feature")]),
         )
@@ -134,19 +164,19 @@ async fn mock_mdp_to_fm_and_fm_to_te_routes_keep_streams_separate() {
 
     assert_eq!(
         router
-            .publish(&SubscriptionKey::new(42, "bbo"), &market)
+            .send_data(&SubscriptionKey::new(42, "bbo"), &market)
             .delivered,
         1
     );
     assert_eq!(
         router
-            .publish(&SubscriptionKey::new(101, "feature"), &feature)
+            .send_data(&SubscriptionKey::new(101, "feature"), &feature)
             .delivered,
         1
     );
 
-    let market_received = fm.outbound.as_mut().unwrap().recv().await.unwrap();
-    let feature_received = te.outbound.as_mut().unwrap().recv().await.unwrap();
+    let market_received = fm.udp_outbound.as_mut().unwrap().recv().await.unwrap();
+    let feature_received = te.udp_outbound.as_mut().unwrap().recv().await.unwrap();
     assert!(matches!(
         WireMessage::decode(&market_received).unwrap(),
         WireMessage::Bbo(value) if value.market_id == 42
@@ -156,6 +186,6 @@ async fn mock_mdp_to_fm_and_fm_to_te_routes_keep_streams_separate() {
         WireMessage::FeatureBbo(value)
             if value.feature_id == 101 && value.market_id == 42
     ));
-    assert!(fm.outbound.as_mut().unwrap().try_recv().is_err());
-    assert!(te.outbound.as_mut().unwrap().try_recv().is_err());
+    assert!(fm.udp_outbound.as_mut().unwrap().try_recv().is_err());
+    assert!(te.udp_outbound.as_mut().unwrap().try_recv().is_err());
 }

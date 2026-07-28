@@ -5,7 +5,8 @@ use std::{ffi::CString, time::Duration};
 
 #[cfg(feature = "aeron")]
 use rusteron_client::{
-    Aeron, AeronCError, AeronContext, AeronExclusivePublication, AeronSubscription, Handlers,
+    Aeron, AeronAsyncAddExclusivePublication, AeronCError, AeronContext, AeronExclusivePublication,
+    AeronSubscription, Handlers,
 };
 
 #[cfg(feature = "aeron")]
@@ -45,13 +46,25 @@ impl AeronClient {
         &self,
         channel: &AeronChannel,
         stream_id: i32,
-    ) -> Result<AeronPublisher, AeronCError> {
+    ) -> Result<AeronPublication, AeronCError> {
         let channel = CString::new(channel.to_channel_string()).expect("invalid Aeron channel");
         let publication = self
             .aeron
             .async_add_exclusive_publication(&channel, stream_id)?
             .poll_blocking(Duration::from_secs(5))?;
-        Ok(AeronPublisher { publication })
+        Ok(AeronPublication { publication })
+    }
+
+    pub fn begin_publisher(
+        &self,
+        channel: &AeronChannel,
+        stream_id: i32,
+    ) -> Result<AeronPublicationRegistration, AeronCError> {
+        let channel = CString::new(channel.to_channel_string()).expect("invalid Aeron channel");
+        let registration = self
+            .aeron
+            .async_add_exclusive_publication(&channel, stream_id)?;
+        Ok(AeronPublicationRegistration { registration })
     }
 
     pub fn subscriber(
@@ -74,12 +87,26 @@ impl AeronClient {
 }
 
 #[cfg(feature = "aeron")]
-pub struct AeronPublisher {
+pub struct AeronPublicationRegistration {
+    registration: AeronAsyncAddExclusivePublication,
+}
+
+#[cfg(feature = "aeron")]
+impl AeronPublicationRegistration {
+    pub fn poll(&self) -> Result<Option<AeronPublication>, AeronCError> {
+        self.registration
+            .poll()
+            .map(|publication| publication.map(|publication| AeronPublication { publication }))
+    }
+}
+
+#[cfg(feature = "aeron")]
+pub struct AeronPublication {
     publication: AeronExclusivePublication,
 }
 
 #[cfg(feature = "aeron")]
-impl AeronPublisher {
+impl AeronPublication {
     pub fn offer(&self, bytes: &[u8]) -> i64 {
         self.publication
             .offer(bytes, Handlers::no_reserved_value_supplier_handler())

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -12,10 +12,10 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::{
-    frame_filter::FrameFilter,
     protocol::{
-        ClientTransportConfig, ControlReply, ControlRequest, SelectTransport, SubscriptionArg,
-        SubscriptionKey, TransportReady, TransportSelection,
+        ClientTransportConfig, ControlEvent, ControlReply, ControlReplyEnvelope, ControlRequest,
+        ControlRequestEnvelope, SelectTransport, StreamError, SubscriptionArg, SubscriptionKey,
+        TransportReady, TransportSelection,
     },
     transport::{ControlEndpoint, InboundFrame},
 };
@@ -23,14 +23,14 @@ use crate::{
 const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
-pub struct LinkClientConfig {
+pub struct ClientConfig {
     pub endpoint: ControlEndpoint,
     pub transport: ClientTransportConfig,
     pub aeron_enabled: bool,
     pub keepalive_interval: Duration,
 }
 
-impl LinkClientConfig {
+impl ClientConfig {
     pub fn new(endpoint: ControlEndpoint, transport: ClientTransportConfig) -> Self {
         Self {
             endpoint,
@@ -44,29 +44,30 @@ impl LinkClientConfig {
 type Sender = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type Receiver = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
-pub struct LinkClient {
-    config: LinkClientConfig,
+pub struct Client {
+    config: ClientConfig,
     sender: Sender,
     receiver: Receiver,
     udp_socket: Option<UdpSocket>,
     ref_counts: HashMap<SubscriptionKey, usize>,
-    frame_filter: FrameFilter,
     last_message_sent: Instant,
     transport_ready: bool,
+    next_request_id: u64,
+    pending_events: VecDeque<ClientEvent>,
 }
 
-impl std::fmt::Debug for LinkClient {
+impl std::fmt::Debug for Client {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("LinkClient")
+            .debug_struct("Client")
             .field("config", &self.config)
             .field("subscriptions", &self.ref_counts)
             .finish_non_exhaustive()
     }
 }
 
-impl LinkClient {
-    pub async fn connect(config: LinkClientConfig) -> Result<Self> {
+impl Client {
+    pub async fn connect(config: ClientConfig) -> Result<Self> {
         if config.transport.is_aeron() && !config.aeron_enabled {
             anyhow::bail!("Aeron transport selected while [aeron].enabled is false");
         }
@@ -92,15 +93,16 @@ impl LinkClient {
             receiver,
             udp_socket,
             ref_counts: HashMap::new(),
-            frame_filter: FrameFilter::default(),
             last_message_sent: Instant::now(),
             transport_ready: false,
+            next_request_id: 1,
+            pending_events: VecDeque::new(),
         };
         client.negotiate_transport().await?;
         Ok(client)
     }
 
-    pub fn config(&self) -> &LinkClientConfig {
+    pub fn config(&self) -> &ClientConfig {
         &self.config
     }
 
@@ -110,39 +112,40 @@ impl LinkClient {
 
     pub async fn acquire(&mut self, arg: SubscriptionArg) -> Result<()> {
         arg.validate()?;
-        let mut first = Vec::new();
-        for key in arg.keys() {
-            let count = self.ref_counts.entry(key.clone()).or_default();
-            if *count == 0 {
-                first.push(key.as_arg());
-            }
-            *count += 1;
-        }
+        let keys = arg.keys().collect::<Vec<_>>();
+        let first = keys
+            .iter()
+            .filter(|key| self.subscription_count(key) == 0)
+            .map(SubscriptionKey::as_arg)
+            .collect::<Vec<_>>();
         if !first.is_empty() {
-            let request = ControlRequest::subscribe(first);
-            self.send_request(request.clone()).await?;
-            self.frame_filter.apply(&request);
+            self.send_request(ControlRequest::subscribe(first)).await?;
+        }
+        for key in keys {
+            *self.ref_counts.entry(key).or_default() += 1;
         }
         Ok(())
     }
 
     pub async fn release(&mut self, arg: SubscriptionArg) -> Result<()> {
         arg.validate()?;
-        let mut last = Vec::new();
-        for key in arg.keys() {
+        let keys = arg.keys().collect::<Vec<_>>();
+        let last = keys
+            .iter()
+            .filter(|key| self.subscription_count(key) == 1)
+            .map(SubscriptionKey::as_arg)
+            .collect::<Vec<_>>();
+        if !last.is_empty() {
+            self.send_request(ControlRequest::unsubscribe(last)).await?;
+        }
+        for key in keys {
             let Some(count) = self.ref_counts.get_mut(&key) else {
                 continue;
             };
             *count -= 1;
             if *count == 0 {
                 self.ref_counts.remove(&key);
-                last.push(key.as_arg());
             }
-        }
-        if !last.is_empty() {
-            let request = ControlRequest::unsubscribe(last);
-            self.send_request(request.clone()).await?;
-            self.frame_filter.apply(&request);
         }
         Ok(())
     }
@@ -156,7 +159,15 @@ impl LinkClient {
             anyhow::bail!("data transport is not ready");
         }
         request.validate()?;
-        self.send_text(serde_json::to_string(&request)?).await
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        let operation = request.op;
+        self.send_text(serde_json::to_string(&ControlRequestEnvelope::new(
+            Some(request_id),
+            request,
+        ))?)
+        .await?;
+        self.await_request_reply(request_id, operation).await
     }
 
     pub async fn resubscribe(&mut self) -> Result<()> {
@@ -176,9 +187,6 @@ impl LinkClient {
     pub async fn reconnect(&mut self) -> Result<()> {
         let mut replacement = Self::connect(self.config.clone()).await?;
         replacement.ref_counts = self.ref_counts.clone();
-        replacement
-            .frame_filter
-            .replace_subscriptions(replacement.ref_counts.keys().cloned());
         replacement.resubscribe().await?;
         *self = replacement;
         Ok(())
@@ -192,38 +200,31 @@ impl LinkClient {
     }
 
     pub async fn poll_control(&mut self) -> Result<Option<ClientEvent>> {
-        loop {
-            let next = self.receiver.next().now_or_never();
-            let Some(next) = next else {
-                return Ok(None);
-            };
-            let Some(frame) = next else {
-                anyhow::bail!("control WebSocket closed");
-            };
-            match frame? {
-                Message::Binary(bytes) => {
-                    if !self.frame_filter.accepts(&bytes) {
-                        continue;
-                    }
-                    return Ok(Some(ClientEvent::Data(InboundFrame {
-                        bytes: bytes.to_vec(),
-                        received_at: Instant::now(),
-                    })));
-                }
-                Message::Text(text) => {
-                    let reply = serde_json::from_str::<ControlReply>(&text)
-                        .map(ClientEvent::Reply)
-                        .unwrap_or_else(|_| ClientEvent::Text(text.to_string()));
-                    return Ok(Some(reply));
-                }
-                Message::Ping(payload) => {
-                    self.send(Message::Pong(payload)).await?;
-                    return Ok(Some(ClientEvent::Keepalive));
-                }
-                Message::Pong(_) => return Ok(Some(ClientEvent::Keepalive)),
-                Message::Close(frame) => anyhow::bail!("control WebSocket closed: {frame:?}"),
-                _ => return Ok(None),
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(Some(event));
+        }
+        let next = self.receiver.next().now_or_never();
+        let Some(next) = next else {
+            return Ok(None);
+        };
+        let Some(frame) = next else {
+            anyhow::bail!("control WebSocket closed");
+        };
+        match frame? {
+            Message::Binary(_) => anyhow::bail!(
+                "binary frames are not allowed on the control WebSocket"
+            ),
+            Message::Text(text) => {
+                let event = parse_client_event(&text)?;
+                Ok(Some(event))
             }
+            Message::Ping(payload) => {
+                self.send(Message::Pong(payload)).await?;
+                Ok(Some(ClientEvent::Keepalive))
+            }
+            Message::Pong(_) => Ok(Some(ClientEvent::Keepalive)),
+            Message::Close(frame) => anyhow::bail!("control WebSocket closed: {frame:?}"),
+            _ => Ok(None),
         }
     }
 
@@ -231,18 +232,13 @@ impl LinkClient {
         let Some(socket) = &self.udp_socket else {
             return Ok(None);
         };
-        loop {
-            match socket.try_recv(buffer) {
-                Ok(size) if self.frame_filter.accepts(&buffer[..size]) => {
-                    return Ok(Some(InboundFrame {
-                        bytes: buffer[..size].to_vec(),
-                        received_at: Instant::now(),
-                    }));
-                }
-                Ok(_) => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-                Err(error) => return Err(error.into()),
-            }
+        match socket.try_recv(buffer) {
+            Ok(size) => Ok(Some(InboundFrame {
+                bytes: buffer[..size].to_vec(),
+                received_at: Instant::now(),
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -251,15 +247,11 @@ impl LinkClient {
             .udp_socket
             .as_ref()
             .context("the link has no UDP data plane")?;
-        loop {
-            let size = socket.recv(buffer).await?;
-            if self.frame_filter.accepts(&buffer[..size]) {
-                return Ok(InboundFrame {
-                    bytes: buffer[..size].to_vec(),
-                    received_at: Instant::now(),
-                });
-            }
-        }
+        let size = socket.recv(buffer).await?;
+        Ok(InboundFrame {
+            bytes: buffer[..size].to_vec(),
+            received_at: Instant::now(),
+        })
     }
 
     pub fn udp_local_addr(&self) -> Result<Option<std::net::SocketAddr>> {
@@ -284,7 +276,6 @@ impl LinkClient {
 
     async fn negotiate_transport(&mut self) -> Result<()> {
         let selection = match &self.config.transport {
-            ClientTransportConfig::WebSocket => TransportSelection::WebSocket,
             ClientTransportConfig::Udp => TransportSelection::Udp {
                 client_port: self
                     .udp_socket
@@ -344,6 +335,52 @@ impl LinkClient {
         self.send(Message::Text(text.into())).await
     }
 
+    async fn await_request_reply(
+        &mut self,
+        request_id: u64,
+        operation: crate::protocol::ControlOperation,
+    ) -> Result<()> {
+        loop {
+            let frame = self
+                .receiver
+                .next()
+                .await
+                .context("control WebSocket closed while awaiting request acknowledgement")??;
+            match frame {
+                Message::Binary(_) => anyhow::bail!(
+                    "binary frames are not allowed on the control WebSocket"
+                ),
+                Message::Text(text) => {
+                    if let Ok(event) = serde_json::from_str::<ControlEvent>(&text) {
+                        let error = event.into_stream_error();
+                        self.pending_events
+                            .push_back(ClientEvent::StreamError(error));
+                        continue;
+                    }
+                    let envelope = serde_json::from_str::<ControlReplyEnvelope>(&text)
+                        .context("invalid control WebSocket message")?;
+                    if envelope.request_id != Some(request_id) {
+                        self.pending_events
+                            .push_back(ClientEvent::Reply(envelope.reply));
+                        continue;
+                    }
+                    return validate_request_reply(operation, envelope.reply);
+                }
+                Message::Ping(payload) => {
+                    self.send(Message::Pong(payload)).await?;
+                    self.pending_events.push_back(ClientEvent::Keepalive);
+                }
+                Message::Pong(_) => self.pending_events.push_back(ClientEvent::Keepalive),
+                Message::Close(frame) => {
+                    anyhow::bail!(
+                        "control WebSocket closed while awaiting request acknowledgement: {frame:?}"
+                    )
+                }
+                _ => {}
+            }
+        }
+    }
+
     async fn send(&mut self, message: Message) -> Result<()> {
         self.sender.send(message).await?;
         self.last_message_sent = Instant::now();
@@ -351,10 +388,33 @@ impl LinkClient {
     }
 }
 
+fn validate_request_reply(
+    operation: crate::protocol::ControlOperation,
+    reply: ControlReply,
+) -> Result<()> {
+    use crate::protocol::ControlOperation;
+
+    match (operation, reply) {
+        (ControlOperation::Subscribe, ControlReply::Subscribed { .. })
+        | (ControlOperation::Unsubscribe, ControlReply::Unsubscribed { .. })
+        | (ControlOperation::RefetchBbo, ControlReply::Refetched { .. }) => Ok(()),
+        (_, ControlReply::Error { message }) => anyhow::bail!(message),
+        (_, reply) => anyhow::bail!("unexpected control reply for {operation:?}: {reply:?}"),
+    }
+}
+
 #[derive(Debug)]
 pub enum ClientEvent {
-    Data(InboundFrame),
     Reply(ControlReply),
-    Text(String),
+    StreamError(StreamError),
     Keepalive,
+}
+
+fn parse_client_event(text: &str) -> Result<ClientEvent> {
+    if let Ok(event) = serde_json::from_str::<ControlEvent>(text) {
+        return Ok(ClientEvent::StreamError(event.into_stream_error()));
+    }
+    let envelope = serde_json::from_str::<ControlReplyEnvelope>(text)
+        .context("invalid control WebSocket message")?;
+    Ok(ClientEvent::Reply(envelope.reply))
 }
