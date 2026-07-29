@@ -1,3 +1,10 @@
+//! Non-blocking client for synchronous connector loops.
+//!
+//! [`PollingClient::connect_tcp`] performs the blocking setup once. The steady
+//! state is then explicit: call [`PollingClient::send_request`], repeatedly
+//! call [`PollingClient::poll`], and match the correlated request ID in
+//! [`PollEvent::Reply`].
+
 use std::{
     collections::HashSet,
     net::{SocketAddr, TcpStream, UdpSocket},
@@ -11,22 +18,28 @@ use crate::protocol::{
     ClientTransportConfig, ControlEvent, ControlReply, ControlReplyEnvelope, ControlRequest,
     ControlRequestEnvelope, SelectTransport, StreamError, TransportReady, TransportSelection,
 };
-use crate::transport::InboundFrame;
-#[cfg(feature = "aeron")]
-use crate::transport::{AeronClient, AeronSubscriber};
+use crate::transport::{AeronClient, AeronSubscriber, InboundFrame};
 
 #[derive(Debug)]
+/// One item produced by [`PollingClient::poll`].
 pub enum PollEvent {
+    /// A market-data frame received over UDP.
     Data(InboundFrame),
+    /// A control reply carrying the request ID assigned by `send_request`.
     Reply(ControlReplyEnvelope),
+    /// An asynchronous service error.
     StreamError(StreamError),
+    /// A WebSocket ping or pong was handled.
     Keepalive,
 }
 
+/// A link client for event loops that cannot await.
+///
+/// Connection and transport negotiation are blocking. After construction the
+/// sockets are non-blocking and [`Self::poll`] returns immediately.
 pub struct PollingClient {
     control: WebSocket<TcpStream>,
     udp: Option<UdpSocket>,
-    #[cfg(feature = "aeron")]
     aeron_subscriber: Option<AeronSubscriber>,
     next_request_id: u64,
     pending_requests: HashSet<u64>,
@@ -48,12 +61,14 @@ impl std::fmt::Debug for PollingClient {
 }
 
 impl PollingClient {
+    /// Opens the WebSocket, negotiates the data plane, then switches every
+    /// socket to non-blocking mode.
     pub fn connect_tcp(
         address: &str,
         timeout: Duration,
         transport: ClientTransportConfig,
     ) -> Result<Self> {
-        #[cfg(feature = "aeron")]
+        // Phase 1: prepare the data receiver before negotiating it.
         let (aeron_subscriber, aeron_udp_port) = match &transport {
             ClientTransportConfig::AeronUdp { stream_id } => {
                 let aeron = AeronClient::connect()
@@ -63,13 +78,7 @@ impl PollingClient {
             }
             _ => (None, None),
         };
-        #[cfg(not(feature = "aeron"))]
-        let aeron_udp_port = match &transport {
-            ClientTransportConfig::AeronUdp { .. } => {
-                anyhow::bail!("Aeron UDP requires the market-data-link `aeron` feature")
-            }
-            _ => None,
-        };
+        // Phase 2: open the reliable WebSocket control plane.
         let socket_target = address
             .strip_prefix("ws://")
             .or_else(|| address.strip_prefix("wss://"))
@@ -97,6 +106,7 @@ impl PollingClient {
             _ => None,
         };
 
+        // Phase 3: send select_transport and wait for transport_ready.
         let selection = match &transport {
             ClientTransportConfig::Udp => TransportSelection::Udp {
                 client_port: udp
@@ -169,6 +179,7 @@ impl PollingClient {
                 _ => {}
             }
         }
+        // Phase 4: setup is complete; steady-state calls must not block.
         control.get_mut().set_read_timeout(None)?;
         control.get_mut().set_write_timeout(None)?;
         control.get_mut().set_nonblocking(true)?;
@@ -178,18 +189,21 @@ impl PollingClient {
         Ok(Self {
             control,
             udp,
-            #[cfg(feature = "aeron")]
             aeron_subscriber,
             next_request_id: 1,
             pending_requests: HashSet::new(),
         })
     }
 
+    /// Sends a raw WebSocket message.
+    ///
+    /// Prefer [`Self::send_request`] for normal link operations so replies can
+    /// be correlated.
     pub fn send(&mut self, message: Message) -> tungstenite::Result<()> {
         self.control.send(message)
     }
 
-    #[cfg(feature = "aeron")]
+    /// Transfers ownership of the negotiated Aeron receiver to the caller.
     pub fn take_aeron_subscriber(&mut self) -> Option<AeronSubscriber> {
         self.aeron_subscriber.take()
     }
@@ -209,10 +223,15 @@ impl PollingClient {
         Ok(request_id)
     }
 
+    /// Flushes buffered control-plane writes.
     pub fn flush(&mut self) -> tungstenite::Result<()> {
         self.control.flush()
     }
 
+    /// Returns the next immediately available data or control event.
+    ///
+    /// UDP is checked first, followed by the WebSocket. `Ok(None)` is the
+    /// normal `WouldBlock` result and does not indicate a disconnect.
     pub fn poll(&mut self) -> Result<Option<PollEvent>> {
         if let Some(socket) = &self.udp {
             let mut bytes = vec![0; 65_535];
@@ -265,12 +284,14 @@ impl PollingClient {
         }
     }
 
+    /// Sends and flushes a ping, returning whether both operations succeeded.
     pub fn probe(&mut self) -> bool {
         self.send(Message::Ping(Vec::new().into()))
             .and_then(|_| self.flush())
             .is_ok()
     }
 
+    /// Returns whether this session selected UDP as its data plane.
     pub fn has_udp(&self) -> bool {
         self.udp.is_some()
     }

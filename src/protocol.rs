@@ -1,3 +1,9 @@
+//! Reliable JSON control protocol shared by clients and servers.
+//!
+//! Transport selection is an uncorrelated setup exchange. Subscription and
+//! refetch operations use request/reply envelopes with a mandatory
+//! `request_id`; asynchronous runtime failures use [`ControlEvent`].
+
 use std::{collections::BTreeSet, net::SocketAddr};
 
 use serde::{Deserialize, Serialize};

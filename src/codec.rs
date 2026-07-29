@@ -1,3 +1,8 @@
+//! Shared binary market-data codecs.
+//!
+//! The link transports raw frames. Producers encode with these types before
+//! publication; TE/FM consumers decode them after receipt.
+
 use thiserror::Error;
 
 pub const BBO_MESSAGE_TYPE: u8 = 1;

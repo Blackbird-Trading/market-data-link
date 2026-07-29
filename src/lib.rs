@@ -1,25 +1,35 @@
 #![doc = include_str!("../README.md")]
 
-#[cfg(feature = "aeron")]
-pub mod aeron_publisher;
 pub mod client;
 pub mod codec;
-pub mod polling;
 pub mod protocol;
 pub mod server;
 pub mod transport;
 
-#[cfg(feature = "aeron")]
-pub use aeron_publisher::{
-    AeronFrame, AeronPublishReport, AeronPublisher, AeronPublisherStats, AeronRoute,
-    JoinCompletion, JoinStatus,
-};
-pub use client::{Client, ClientConfig};
-pub use polling::{PollEvent, PollingClient};
+/// Compatibility module for the original flat module layout.
+///
+/// New code can use [`server::aeron_publisher`] to make the server-side
+/// ownership explicit.
+pub mod aeron_publisher {
+    pub use crate::server::aeron_publisher::*;
+}
+
+/// Compatibility module for the original flat module layout.
+///
+/// New code can use [`client::polling`] to make the client role explicit.
+pub mod polling {
+    pub use crate::client::polling::*;
+}
+
+pub use client::{Client, ClientConfig, ClientEvent, PollEvent, PollingClient};
 pub use protocol::{
     AeronChannel, AeronConfig, ClientTransportConfig, ControlEvent, ControlOperation, ControlReply,
     ControlReplyEnvelope, ControlRequest, ControlRequestEnvelope, SelectTransport, StreamError,
     SubscriptionArg, SubscriptionKey, TransportReady, TransportSelection,
+};
+pub use server::aeron_publisher::{
+    AeronFrame, AeronPublishReport, AeronPublisher, AeronPublisherStats, AeronRoute,
+    JoinCompletion, JoinStatus,
 };
 pub use server::{
     ClientRouter, PublishReport, Server, ServerConfig, ServerHandler, SessionChannels,

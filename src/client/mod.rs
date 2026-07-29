@@ -1,7 +1,21 @@
+//! Asynchronous client API.
+//!
+//! The client lifecycle is intentionally linear:
+//!
+//! 1. [`Client::connect`] opens the WebSocket control plane.
+//! 2. It prepares and negotiates the selected data transport.
+//! 3. [`Client::send_request`] sends a request with a unique ID.
+//! 4. The client waits for the reply carrying that same ID.
+//! 5. Market data is read from UDP or from [`Client::take_aeron_subscriber`].
+
 use std::{
     collections::{HashMap, VecDeque},
     time::{Duration, Instant},
 };
+
+pub mod polling;
+
+pub use polling::{PollEvent, PollingClient};
 
 use anyhow::{Context, Result};
 use futures_util::{
@@ -11,7 +25,6 @@ use futures_util::{
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
-#[cfg(feature = "aeron")]
 use crate::transport::{AeronClient, AeronSubscriber};
 use crate::{
     protocol::{
@@ -25,14 +38,21 @@ use crate::{
 const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
+/// Settings used for every connection and reconnection.
 pub struct ClientConfig {
+    /// WebSocket endpoint used for reliable control messages.
     pub endpoint: ControlEndpoint,
+    /// Data plane to negotiate immediately after the WebSocket opens.
     pub transport: ClientTransportConfig,
+    /// Whether this process is allowed to connect to the Aeron media driver.
     pub aeron_enabled: bool,
+    /// Idle duration after which [`Client::send_ping_if_due`] sends a ping.
     pub keepalive_interval: Duration,
 }
 
 impl ClientConfig {
+    /// Creates a client configuration with Aeron disabled and a 30-second
+    /// keepalive interval.
     pub fn new(endpoint: ControlEndpoint, transport: ClientTransportConfig) -> Self {
         Self {
             endpoint,
@@ -51,7 +71,6 @@ pub struct Client {
     sender: Sender,
     receiver: Receiver,
     udp_socket: Option<UdpSocket>,
-    #[cfg(feature = "aeron")]
     aeron_subscriber: Option<AeronSubscriber>,
     aeron_udp_port: Option<u16>,
     ref_counts: HashMap<SubscriptionKey, usize>,
@@ -72,11 +91,16 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
+    /// Connects the control plane and completes data-plane negotiation.
+    ///
+    /// A successful return means the server has replied with
+    /// `transport_ready`; subscription requests can be sent immediately.
     pub async fn connect(config: ClientConfig) -> Result<Self> {
+        // Phase 1: prepare any receive endpoint whose details must be included
+        // in the transport selection request.
         if config.transport.is_aeron() && !config.aeron_enabled {
             anyhow::bail!("Aeron transport selected while [aeron].enabled is false");
         }
-        #[cfg(feature = "aeron")]
         let (aeron_subscriber, aeron_udp_port) = match &config.transport {
             ClientTransportConfig::AeronUdp { stream_id } => {
                 let aeron = AeronClient::connect()
@@ -86,13 +110,8 @@ impl Client {
             }
             _ => (None, None),
         };
-        #[cfg(not(feature = "aeron"))]
-        let aeron_udp_port = match &config.transport {
-            ClientTransportConfig::AeronUdp { .. } => {
-                anyhow::bail!("Aeron UDP requires the market-data-link `aeron` feature")
-            }
-            _ => None,
-        };
+
+        // Phase 2: open the reliable WebSocket control plane.
         let ControlEndpoint::Tcp(uri) = &config.endpoint;
         let (stream, _) = connect_async(uri)
             .await
@@ -109,12 +128,13 @@ impl Client {
             None
         };
 
+        // Phase 3: ask the server to use the prepared data plane and wait for
+        // its transport_ready reply.
         let mut client = Self {
             config,
             sender,
             receiver,
             udp_socket,
-            #[cfg(feature = "aeron")]
             aeron_subscriber,
             aeron_udp_port,
             ref_counts: HashMap::new(),
@@ -127,19 +147,29 @@ impl Client {
         Ok(client)
     }
 
+    /// Returns the immutable settings used by this connection.
     pub fn config(&self) -> &ClientConfig {
         &self.config
     }
 
-    #[cfg(feature = "aeron")]
+    /// Transfers ownership of the negotiated Aeron receiver to the caller.
+    ///
+    /// This returns `None` for UDP and after the receiver has already been
+    /// taken.
     pub fn take_aeron_subscriber(&mut self) -> Option<AeronSubscriber> {
         self.aeron_subscriber.take()
     }
 
+    /// Returns the number of local owners of one confirmed subscription.
     pub fn subscription_count(&self, key: &SubscriptionKey) -> usize {
         self.ref_counts.get(key).copied().unwrap_or_default()
     }
 
+    /// Acquires logical references to one or more subscriptions.
+    ///
+    /// Only subscriptions whose local count changes from zero to one are sent
+    /// to the server. Counts are committed after the server acknowledges the
+    /// request.
     pub async fn acquire(&mut self, arg: SubscriptionArg) -> Result<()> {
         arg.validate()?;
         let keys = arg.keys().collect::<Vec<_>>();
@@ -157,6 +187,11 @@ impl Client {
         Ok(())
     }
 
+    /// Releases logical references to one or more subscriptions.
+    ///
+    /// Only subscriptions whose local count changes from one to zero are sent
+    /// to the server. Counts are committed after the server acknowledges the
+    /// request.
     pub async fn release(&mut self, arg: SubscriptionArg) -> Result<()> {
         arg.validate()?;
         let keys = arg.keys().collect::<Vec<_>>();
@@ -180,10 +215,18 @@ impl Client {
         Ok(())
     }
 
+    /// Requests fresh BBO data for the supplied IDs.
+    ///
+    /// The reply only acknowledges the request; refreshed market data arrives
+    /// later on the negotiated data plane.
     pub async fn refetch_bbo(&mut self, ids: impl IntoIterator<Item = i32>) -> Result<()> {
         self.send_request(ControlRequest::refetch_bbo(ids)).await
     }
 
+    /// Sends one validated request and waits for its correlated reply.
+    ///
+    /// While waiting, asynchronous stream errors, keepalives, and replies for
+    /// other request IDs are buffered for [`Self::poll_control`].
     pub async fn send_request(&mut self, request: ControlRequest) -> Result<()> {
         if !self.transport_ready {
             anyhow::bail!("data transport is not ready");
@@ -199,6 +242,7 @@ impl Client {
         self.await_request_reply(request_id, operation).await
     }
 
+    /// Re-sends the current confirmed subscription set.
     pub async fn resubscribe(&mut self) -> Result<()> {
         let args = self
             .ref_counts
@@ -221,6 +265,7 @@ impl Client {
         Ok(())
     }
 
+    /// Sends a WebSocket ping when the configured idle interval has elapsed.
     pub async fn send_ping_if_due(&mut self) -> Result<()> {
         if self.last_message_sent.elapsed() >= self.config.keepalive_interval {
             self.send(Message::Ping(Vec::new().into())).await?;
@@ -228,6 +273,10 @@ impl Client {
         Ok(())
     }
 
+    /// Non-blockingly reads one buffered or immediately available control event.
+    ///
+    /// `Ok(None)` means no event is ready. It does not mean the connection
+    /// closed.
     pub async fn poll_control(&mut self) -> Result<Option<ClientEvent>> {
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(Some(event));
@@ -257,6 +306,9 @@ impl Client {
         }
     }
 
+    /// Non-blockingly receives one UDP market-data frame.
+    ///
+    /// Returns `Ok(None)` when UDP is not selected or no datagram is ready.
     pub fn try_recv_udp(&mut self, buffer: &mut [u8]) -> Result<Option<InboundFrame>> {
         let Some(socket) = &self.udp_socket else {
             return Ok(None);
@@ -271,6 +323,10 @@ impl Client {
         }
     }
 
+    /// Waits for the next UDP market-data frame.
+    ///
+    /// Unlike [`Self::try_recv_udp`], this is asynchronous and waits until a
+    /// datagram arrives. It returns an error if UDP was not selected.
     pub async fn recv_udp(&mut self, buffer: &mut [u8]) -> Result<InboundFrame> {
         let socket = self
             .udp_socket
@@ -283,6 +339,7 @@ impl Client {
         })
     }
 
+    /// Returns the local UDP endpoint when UDP is selected.
     pub fn udp_local_addr(&self) -> Result<Option<std::net::SocketAddr>> {
         self.udp_socket
             .as_ref()
@@ -291,6 +348,7 @@ impl Client {
             .map_err(Into::into)
     }
 
+    /// Returns the negotiated server UDP endpoint when UDP is selected.
     pub fn udp_peer_addr(&self) -> Result<Option<std::net::SocketAddr>> {
         self.udp_socket
             .as_ref()
@@ -299,10 +357,14 @@ impl Client {
             .map_err(Into::into)
     }
 
+    /// Sends a normal WebSocket close frame.
     pub async fn close(&mut self) -> Result<()> {
         self.send(Message::Close(None)).await
     }
 
+    /// Sends `select_transport` and waits for the server's `transport_ready`.
+    ///
+    /// Subscription traffic is deliberately unavailable until this completes.
     async fn negotiate_transport(&mut self) -> Result<()> {
         let selection = match &self.config.transport {
             ClientTransportConfig::Udp => TransportSelection::Udp {
@@ -363,6 +425,10 @@ impl Client {
         self.send(Message::Text(text.into())).await
     }
 
+    /// Receives control messages until the matching request reply arrives.
+    ///
+    /// The request ID is the correlation boundary. Other valid control
+    /// messages are preserved in `pending_events` instead of being lost.
     async fn await_request_reply(
         &mut self,
         request_id: u64,
@@ -432,9 +498,13 @@ fn validate_request_reply(
 }
 
 #[derive(Debug)]
+/// An asynchronous control-plane event not consumed by a request wait.
 pub enum ClientEvent {
+    /// A reply for a request other than the one currently being awaited.
     Reply(ControlReply),
+    /// A service runtime error, optionally scoped to an ID and stream.
     StreamError(StreamError),
+    /// A ping or pong was handled.
     Keepalive,
 }
 

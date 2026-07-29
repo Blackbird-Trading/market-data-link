@@ -1,39 +1,44 @@
+//! Shared low-level data-plane primitives.
+//!
+//! Most users should start with [`crate::Client`] or [`crate::Server`].
+//! Services with a busy-spin Aeron consumer can take an [`AeronSubscriber`]
+//! from a connected client and access the underlying subscription here.
+
 use std::time::Instant;
 
-#[cfg(feature = "aeron")]
 use std::{ffi::CString, net::SocketAddr, time::Duration};
 
-#[cfg(feature = "aeron")]
 use anyhow::{Context, bail};
-#[cfg(feature = "aeron")]
 use rusteron_client::{
     Aeron, AeronAsyncAddExclusivePublication, AeronCError, AeronContext, AeronExclusivePublication,
     AeronSubscription, Handlers,
 };
 
-#[cfg(feature = "aeron")]
 use crate::protocol::AeronChannel;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Reliable control-plane endpoint.
 pub enum ControlEndpoint {
     Tcp(String),
 }
 
+/// Default Aeron media-driver directory used by all link roles.
 pub const AERON_DRIVER_DIR: &str = "/dev/shm/aeron";
 
 #[derive(Debug, Clone)]
+/// Raw data-plane payload plus the process-local receive timestamp.
 pub struct InboundFrame {
     pub bytes: Vec<u8>,
     pub received_at: Instant,
 }
 
-#[cfg(feature = "aeron")]
+/// Connection to the local Aeron media driver.
 pub struct AeronClient {
     aeron: Aeron,
 }
 
-#[cfg(feature = "aeron")]
 impl AeronClient {
+    /// Connects to the media driver at [`AERON_DRIVER_DIR`].
     pub fn connect() -> Result<Self, AeronCError> {
         let context = AeronContext::new()?;
         let directory =
@@ -44,6 +49,7 @@ impl AeronClient {
         Ok(Self { aeron })
     }
 
+    /// Registers an exclusive publication and waits until it is usable.
     pub fn publisher(
         &self,
         channel: &AeronChannel,
@@ -57,6 +63,7 @@ impl AeronClient {
         Ok(AeronPublication { publication })
     }
 
+    /// Starts non-blocking exclusive-publication registration.
     pub fn begin_publisher(
         &self,
         channel: &AeronChannel,
@@ -69,6 +76,7 @@ impl AeronClient {
         Ok(AeronPublicationRegistration { registration })
     }
 
+    /// Registers a subscription and waits until it is usable.
     pub fn subscriber(
         &self,
         channel: &AeronChannel,
@@ -87,6 +95,7 @@ impl AeronClient {
         Ok(AeronSubscriber { subscription })
     }
 
+    /// Registers a wildcard UDP subscription and returns its resolved port.
     pub fn ephemeral_udp_subscriber(
         &self,
         stream_id: i32,
@@ -99,13 +108,13 @@ impl AeronClient {
     }
 }
 
-#[cfg(feature = "aeron")]
+/// An in-progress exclusive-publication registration.
 pub struct AeronPublicationRegistration {
     registration: AeronAsyncAddExclusivePublication,
 }
 
-#[cfg(feature = "aeron")]
 impl AeronPublicationRegistration {
+    /// Returns the publication when registration completes.
     pub fn poll(&self) -> Result<Option<AeronPublication>, AeronCError> {
         self.registration
             .poll()
@@ -113,34 +122,36 @@ impl AeronPublicationRegistration {
     }
 }
 
-#[cfg(feature = "aeron")]
+/// Ready exclusive Aeron publication.
 pub struct AeronPublication {
     publication: AeronExclusivePublication,
 }
 
-#[cfg(feature = "aeron")]
 impl AeronPublication {
+    /// Offers one payload without retrying.
     pub fn offer(&self, bytes: &[u8]) -> i64 {
         self.publication
             .offer(bytes, Handlers::no_reserved_value_supplier_handler())
     }
 
+    /// Returns whether the publication currently has a connected image.
     pub fn is_connected(&self) -> bool {
         self.publication.is_connected()
     }
 }
 
-#[cfg(feature = "aeron")]
+/// Ready Aeron subscription owned by the consuming service loop.
 pub struct AeronSubscriber {
     subscription: AeronSubscription,
 }
 
-#[cfg(feature = "aeron")]
 impl AeronSubscriber {
+    /// Exposes the low-level subscription for service-specific polling.
     pub fn subscription(&self) -> &AeronSubscription {
         &self.subscription
     }
 
+    /// Returns whether the subscription currently has a connected image.
     pub fn is_connected(&self) -> bool {
         self.subscription.is_connected()
     }
@@ -168,7 +179,6 @@ impl AeronSubscriber {
     }
 }
 
-#[cfg(feature = "aeron")]
 fn resolved_endpoint_port(channel_uri: &str) -> anyhow::Result<Option<u16>> {
     let endpoint = channel_uri
         .split_once('?')
@@ -183,7 +193,7 @@ fn resolved_endpoint_port(channel_uri: &str) -> anyhow::Result<Option<u16>> {
     Ok((address.port() != 0).then_some(address.port()))
 }
 
-#[cfg(all(test, feature = "aeron"))]
+#[cfg(test)]
 mod tests {
     use super::resolved_endpoint_port;
 

@@ -1,3 +1,16 @@
+//! Server-side session lifecycle and UDP routing.
+//!
+//! The network flow is centralized here:
+//!
+//! 1. [`Server::run`] accepts a TCP connection.
+//! 2. The connection is upgraded to WebSocket and
+//!    [`ServerHandler::open_session`] creates service state.
+//! 3. The client selects a data transport.
+//! 4. Each correlated request is validated and passed to
+//!    [`ServerHandler::handle_request`].
+//! 5. The resulting reply is sent with the original request ID.
+//! 6. Disconnect always finishes with [`ServerHandler::close_session`].
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
@@ -7,6 +20,8 @@ use std::{
     },
     time::Duration,
 };
+
+pub mod aeron_publisher;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -28,13 +43,18 @@ use crate::protocol::{
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
+/// Process-wide settings for the link server.
 pub struct ServerConfig {
+    /// Address on which the WebSocket control listener binds.
     pub tcp_bind_addr: String,
+    /// Whether clients may select Aeron as their data plane.
     pub aeron_enabled: bool,
+    /// Interval between active-session summaries.
     pub active_client_log_interval: Duration,
 }
 
 impl ServerConfig {
+    /// Creates a TCP/WebSocket configuration with Aeron disabled.
     pub fn tcp(tcp_bind_addr: impl Into<String>) -> Self {
         Self {
             tcp_bind_addr: tcp_bind_addr.into(),
@@ -44,6 +64,10 @@ impl ServerConfig {
     }
 }
 
+/// Per-session receivers created by the service handler.
+///
+/// The server owns and drains these receivers; the handler retains the
+/// corresponding senders.
 pub struct SessionChannels {
     pub client_id: u64,
     pub udp_outbound: Option<mpsc::Receiver<Vec<u8>>>,
@@ -51,6 +75,7 @@ pub struct SessionChannels {
 }
 
 impl SessionChannels {
+    /// Creates a session that uses only WebSocket control messages.
     pub fn control_only(client_id: u64) -> Self {
         Self {
             client_id,
@@ -61,12 +86,14 @@ impl SessionChannels {
 }
 
 #[derive(Debug)]
+/// Reliable service-to-client commands sent on the control WebSocket.
 pub enum SessionControl {
     StreamError(StreamError),
     Close,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Result of attempting UDP fanout to matching sessions.
 pub struct PublishReport {
     pub delivered: usize,
     pub full: usize,
@@ -89,6 +116,8 @@ pub struct ClientRouter {
 }
 
 impl ClientRouter {
+    /// Registers a client and returns the bounded receivers consumed by
+    /// [`Server`].
     pub fn register_client(&self, client_id: u64, capacity: usize) -> SessionChannels {
         let (sender, udp_outbound) = mpsc::channel(capacity);
         let (control_sender, control) = mpsc::channel(capacity);
@@ -110,6 +139,7 @@ impl ClientRouter {
         }
     }
 
+    /// Applies a successfully handled request to the client's routing table.
     pub fn update_subscriptions(&self, client_id: u64, request: &ControlRequest) -> Result<()> {
         let mut sessions = self
             .sessions
@@ -130,6 +160,7 @@ impl ClientRouter {
         Ok(())
     }
 
+    /// Removes all routing and control state for a client.
     pub fn remove_client(&self, client_id: u64) {
         self.sessions
             .write()
@@ -162,6 +193,71 @@ impl ClientRouter {
                 .subscriptions
                 .iter()
                 .any(|subscription| subscription.id == key.id && subscription.stream == key.stream)
+            {
+                continue;
+            }
+            let Some(sender) = &session.sender else {
+                continue;
+            };
+            match sender.try_send(bytes.to_vec()) {
+                Ok(()) => report.delivered += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => report.full += 1,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    report.closed += 1;
+                    closed.push(*client_id);
+                }
+            }
+        }
+        drop(sessions);
+        if !closed.is_empty() {
+            let mut sessions = self
+                .sessions
+                .write()
+                .expect("subscription router lock poisoned");
+            for client_id in closed {
+                sessions.remove(&client_id);
+            }
+        }
+        report
+    }
+
+    /// Sends a refetched frame to one client without broadcasting it to every
+    /// subscriber of the same stream.
+    pub fn send_data_to_client(&self, client_id: u64, bytes: &[u8]) -> PublishReport {
+        let sessions = self
+            .sessions
+            .read()
+            .expect("subscription router lock poisoned");
+        let mut report = PublishReport::default();
+        let Some(session) = sessions.get(&client_id) else {
+            report.closed = 1;
+            return report;
+        };
+        let Some(sender) = &session.sender else {
+            return report;
+        };
+        match sender.try_send(bytes.to_vec()) {
+            Ok(()) => report.delivered = 1,
+            Err(mpsc::error::TrySendError::Full(_)) => report.full = 1,
+            Err(mpsc::error::TrySendError::Closed(_)) => report.closed = 1,
+        }
+        report
+    }
+
+    /// Sends market status once to each UDP client subscribed to any stream
+    /// for the affected market.
+    pub fn send_market_status(&self, market_id: i32, bytes: &[u8]) -> PublishReport {
+        let sessions = self
+            .sessions
+            .read()
+            .expect("subscription router lock poisoned");
+        let mut report = PublishReport::default();
+        let mut closed = Vec::new();
+        for (client_id, session) in sessions.iter() {
+            if !session
+                .subscriptions
+                .iter()
+                .any(|subscription| subscription.id == market_id)
             {
                 continue;
             }
@@ -250,7 +346,12 @@ impl ClientRouter {
 }
 
 #[async_trait]
+/// Domain adapter called by [`Server`] at the four service lifecycle points.
+///
+/// Implementations do not need to parse WebSocket messages, correlate request
+/// IDs, negotiate UDP, or guarantee disconnect cleanup.
 pub trait ServerHandler: Clone + Send + Sync + 'static {
+    /// Creates service-side state for a newly upgraded WebSocket session.
     async fn open_session(&self, suggested_client_id: u64) -> Result<SessionChannels>;
     /// Applies request arguments in handler-defined order.
     ///
@@ -259,6 +360,7 @@ pub trait ServerHandler: Clone + Send + Sync + 'static {
     /// exact remote state must reconnect and resubscribe their confirmed set.
     async fn handle_request(&self, client_id: u64, request: ControlRequest)
     -> Result<ControlReply>;
+    /// Makes an Aeron publication usable before `transport_ready` is sent.
     async fn select_aeron(&self, _client_id: u64, _config: AeronConfig) -> Result<()> {
         anyhow::bail!("Aeron is not supported by this server handler")
     }
@@ -266,16 +368,20 @@ pub trait ServerHandler: Clone + Send + Sync + 'static {
     async fn close_session(&self, client_id: u64) -> Result<()>;
 }
 
+/// WebSocket control server parameterized by a service-specific handler.
 pub struct Server<H> {
     config: ServerConfig,
     handler: H,
 }
 
 impl<H: ServerHandler> Server<H> {
+    /// Creates a server. No sockets are opened until [`Self::run`].
     pub fn new(config: ServerConfig, handler: H) -> Self {
         Self { config, handler }
     }
 
+    /// Accepts and supervises link sessions until the listener fails or the
+    /// task is cancelled.
     pub async fn run(self) -> Result<()> {
         let tcp_listener = TcpListener::bind(&self.config.tcp_bind_addr)
             .await
@@ -347,6 +453,14 @@ impl<H: ServerHandler> Server<H> {
     }
 }
 
+struct SessionRuntime {
+    client_id: u64,
+    peer_ip: IpAddr,
+    local_ip: IpAddr,
+    udp_target: Option<SocketAddr>,
+    transport_ready: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session<T, H>(
     stream: T,
@@ -368,8 +482,13 @@ where
     let client_id = session.client_id;
     active_clients.write().await.insert(client_id, peer.clone());
     info!(client_id, %peer, "link client connected");
-    let mut udp_target = None;
-    let mut transport_ready = false;
+    let mut runtime = SessionRuntime {
+        client_id,
+        peer_ip,
+        local_ip,
+        udp_target: None,
+        transport_ready: false,
+    };
 
     let result: Result<()> = async {
         loop {
@@ -378,122 +497,16 @@ where
                 let Some(frame) = frame else { break };
                 match frame? {
                     Message::Text(text) => {
-                        if let Ok(selection) = serde_json::from_str::<SelectTransport>(&text) {
-                            if transport_ready {
-                                send_reply(&mut websocket, &ControlReply::error("transport has already been selected")).await?;
-                                continue;
-                            }
-                            let ready = match selection.transport {
-                                TransportSelection::Udp { client_port } => {
-                                    if client_port == 0 {
-                                        send_reply(&mut websocket, &ControlReply::error("UDP client port must be non-zero")).await?;
-                                        continue;
-                                    }
-                                    let socket = udp_socket
-                                        .get_or_try_init(|| async {
-                                            Ok::<_, std::io::Error>(Arc::new(
-                                                UdpSocket::bind("0.0.0.0:0").await?,
-                                            ))
-                                        })
-                                        .await?;
-                                    udp_target = Some(SocketAddr::new(peer_ip, client_port));
-                                    TransportReady::Udp {
-                                        server_address: SocketAddr::new(
-                                            local_ip,
-                                            socket.local_addr()?.port(),
-                                        ),
-                                    }
-                                }
-                                selection @ (TransportSelection::AeronIpc { .. }
-                                | TransportSelection::AeronUdp { .. }) => {
-                                    if !aeron_enabled {
-                                        send_reply(&mut websocket, &ControlReply::error(
-                                            "Aeron transport selected while [aeron].enabled is false"
-                                        )).await?;
-                                        continue;
-                                    }
-                                    if matches!(
-                                        selection,
-                                        TransportSelection::AeronUdp {
-                                            client_port: 0,
-                                            ..
-                                        }
-                                    ) {
-                                        send_reply(&mut websocket, &ControlReply::error(
-                                            "Aeron UDP client port must be non-zero"
-                                        )).await?;
-                                        continue;
-                                    }
-                                    let config = selection
-                                        .aeron_config(peer_ip)
-                                        .expect("Aeron selection must produce an Aeron config");
-                                    if let Err(error) = handler.select_aeron(client_id, config).await {
-                                        send_reply(&mut websocket, &ControlReply::error(error)).await?;
-                                        continue;
-                                    }
-                                    // Aeron is now the sole data plane. Dropping this receiver
-                                    // prevents the session from polling or buffering the
-                                    // per-client fanout path.
-                                    session.udp_outbound = None;
-                                    match selection {
-                                        TransportSelection::AeronIpc { stream_id } => {
-                                            TransportReady::AeronIpc { stream_id }
-                                        }
-                                        TransportSelection::AeronUdp {
-                                            client_port,
-                                            stream_id,
-                                        } => {
-                                            TransportReady::AeronUdp {
-                                                endpoint: SocketAddr::new(peer_ip, client_port),
-                                                stream_id,
-                                            }
-                                        }
-                                        _ => unreachable!(),
-                                    }
-                                }
-                            };
-                            transport_ready = true;
-                            send_reply(
-                                &mut websocket,
-                                &ControlReply::TransportReady { transport: ready },
-                            )
-                            .await?;
-                            continue;
-                        }
-                        let envelope = match serde_json::from_str::<ControlRequestEnvelope>(&text) {
-                            Ok(envelope) => envelope,
-                            Err(error) => {
-                                send_reply(&mut websocket, &ControlReply::error(format!("invalid control request: {error}"))).await?;
-                                continue;
-                            }
-                        };
-                        let request_id = envelope.request_id;
-                        let request = envelope.request;
-                        if let Err(error) = request.validate() {
-                            send_request_reply(
-                                &mut websocket,
-                                request_id,
-                                &ControlReply::error(error),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        if !transport_ready {
-                            send_request_reply(
-                                &mut websocket,
-                                request_id,
-                                &ControlReply::error(
-                                    "select_transport must succeed before subscriptions"
-                                ),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        let reply = handler
-                            .handle_request(client_id, request)
-                            .await
-                            .unwrap_or_else(ControlReply::error);
-                        send_request_reply(&mut websocket, request_id, &reply).await?;
+                        handle_text_message(
+                            &mut websocket,
+                            &text,
+                            &mut runtime,
+                            &mut session,
+                            &udp_socket,
+                            &handler,
+                            aeron_enabled,
+                        )
+                        .await?;
                     }
                     Message::Binary(_) => {
                         send_reply(&mut websocket, &ControlReply::error("binary client messages are unsupported")).await?;
@@ -506,9 +519,9 @@ where
                 }
             }
             data = recv_optional(&mut session.udp_outbound),
-                if session.udp_outbound.is_some() && udp_target.is_some() => {
+                if session.udp_outbound.is_some() && runtime.udp_target.is_some() => {
                 let Some(data) = data else { break };
-                if let (Some(socket), Some(target)) = (udp_socket.get(), udp_target) {
+                if let (Some(socket), Some(target)) = (udp_socket.get(), runtime.udp_target) {
                     socket.send_to(&data, target).await?;
                 }
             }
@@ -537,6 +550,142 @@ where
         (Ok(()), Err(error)) => Err(error.context("server handler cleanup failed")),
         (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+/// Handles the control-plane flow for one client text frame.
+///
+/// Transport selection is the only uncorrelated exchange. Every later request
+/// is validated, delegated to the service handler, and answered with its
+/// original request ID.
+async fn handle_text_message<T, H>(
+    websocket: &mut WebSocketStream<T>,
+    text: &str,
+    runtime: &mut SessionRuntime,
+    session: &mut SessionChannels,
+    udp_socket: &OnceCell<Arc<UdpSocket>>,
+    handler: &H,
+    aeron_enabled: bool,
+) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    H: ServerHandler,
+{
+    if let Ok(selection) = serde_json::from_str::<SelectTransport>(text) {
+        let reply = select_transport(
+            selection.transport,
+            runtime,
+            session,
+            udp_socket,
+            handler,
+            aeron_enabled,
+        )
+        .await?;
+        send_reply(websocket, &reply).await?;
+        return Ok(());
+    }
+
+    let envelope = match serde_json::from_str::<ControlRequestEnvelope>(text) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            send_reply(
+                websocket,
+                &ControlReply::error(format!("invalid control request: {error}")),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let request_id = envelope.request_id;
+    let request = envelope.request;
+
+    let reply = if let Err(error) = request.validate() {
+        ControlReply::error(error)
+    } else if !runtime.transport_ready {
+        ControlReply::error("select_transport must succeed before subscriptions")
+    } else {
+        handler
+            .handle_request(runtime.client_id, request)
+            .await
+            .unwrap_or_else(ControlReply::error)
+    };
+    send_request_reply(websocket, request_id, &reply).await
+}
+
+/// Applies the selected data transport and returns the exact reply to send.
+///
+/// Errors are protocol replies rather than task failures, so a client may
+/// correct its selection without reconnecting.
+async fn select_transport<H: ServerHandler>(
+    selection: TransportSelection,
+    runtime: &mut SessionRuntime,
+    session: &mut SessionChannels,
+    udp_socket: &OnceCell<Arc<UdpSocket>>,
+    handler: &H,
+    aeron_enabled: bool,
+) -> Result<ControlReply> {
+    if runtime.transport_ready {
+        return Ok(ControlReply::error("transport has already been selected"));
+    }
+
+    let prepared = match selection {
+        TransportSelection::Udp { client_port } => {
+            if client_port == 0 {
+                return Ok(ControlReply::error("UDP client port must be non-zero"));
+            }
+            let socket = udp_socket
+                .get_or_try_init(|| async {
+                    Ok::<_, std::io::Error>(Arc::new(UdpSocket::bind("0.0.0.0:0").await?))
+                })
+                .await?;
+            runtime.udp_target = Some(SocketAddr::new(runtime.peer_ip, client_port));
+            TransportReady::Udp {
+                server_address: SocketAddr::new(runtime.local_ip, socket.local_addr()?.port()),
+            }
+        }
+        selection @ (TransportSelection::AeronIpc { .. } | TransportSelection::AeronUdp { .. }) => {
+            if !aeron_enabled {
+                return Ok(ControlReply::error(
+                    "Aeron transport selected while [aeron].enabled is false",
+                ));
+            }
+            if matches!(
+                selection,
+                TransportSelection::AeronUdp { client_port: 0, .. }
+            ) {
+                return Ok(ControlReply::error(
+                    "Aeron UDP client port must be non-zero",
+                ));
+            }
+            let config = selection
+                .aeron_config(runtime.peer_ip)
+                .expect("Aeron selection must produce an Aeron config");
+            if let Err(error) = handler.select_aeron(runtime.client_id, config).await {
+                return Ok(ControlReply::error(error));
+            }
+
+            // Aeron is now the sole data plane. Stop polling and buffering the
+            // per-client UDP fanout path.
+            session.udp_outbound = None;
+            match selection {
+                TransportSelection::AeronIpc { stream_id } => {
+                    TransportReady::AeronIpc { stream_id }
+                }
+                TransportSelection::AeronUdp {
+                    client_port,
+                    stream_id,
+                } => TransportReady::AeronUdp {
+                    endpoint: SocketAddr::new(runtime.peer_ip, client_port),
+                    stream_id,
+                },
+                _ => unreachable!(),
+            }
+        }
+    };
+
+    runtime.transport_ready = true;
+    Ok(ControlReply::TransportReady {
+        transport: prepared,
+    })
 }
 
 async fn send_event<T>(websocket: &mut WebSocketStream<T>, event: &ControlEvent) -> Result<()>
