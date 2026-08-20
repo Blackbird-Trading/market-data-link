@@ -1,22 +1,17 @@
-//! Shared binary market-data codecs.
-//!
-//! The link transports raw frames. Producers encode with these types before
-//! publication; TE/FM consumers decode them after receipt.
+//! Canonical binary market-data messages produced by MDP.
 
 use thiserror::Error;
 
+pub const STATUS_MESSAGE_TYPE: u8 = 0;
 pub const BBO_MESSAGE_TYPE: u8 = 1;
 pub const TRADE_MESSAGE_TYPE: u8 = 2;
 pub const SNAPSHOT_MESSAGE_TYPE: u8 = 3;
 pub const DEPTH_UPDATE_MESSAGE_TYPE: u8 = 4;
-pub const STATUS_MESSAGE_TYPE: u8 = 0;
-pub const FEATURE_BBO_MESSAGE_TYPE: u8 = 6;
 
 pub const BBO_WIRE_LEN: usize = 61;
 pub const TRADE_WIRE_LEN: usize = 46;
 pub const ORDER_BOOK_HEADER_LEN: usize = 55;
 pub const ORDER_BOOK_LEVEL_LEN: usize = 32;
-pub const FEATURE_BBO_WIRE_LEN: usize = 97;
 pub const STATUS_WIRE_LEN: usize = 31;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -240,88 +235,6 @@ impl OrderBook {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FeatureBbo {
-    pub feature_id: i32,
-    pub market_id: i32,
-    pub timestamp_mdp_in: i64,
-    pub bid: f64,
-    pub bid_volume: f64,
-    pub ask: f64,
-    pub ask_volume: f64,
-    pub event_id: u64,
-    pub ts_mono_mdp_out: i64,
-    pub mdp_received_ts_ns: u64,
-    pub feature_start_ts_ns: u64,
-    pub feature_done_ts_ns: u64,
-    pub signal_bps: f64,
-}
-
-impl FeatureBbo {
-    pub fn neutral_for_status(
-        feature_id: i32,
-        status: &MarketStatus,
-        ts_mono_mdp_out: i64,
-        mdp_received_ts_ns: u64,
-        feature_start_ts_ns: u64,
-        feature_done_ts_ns: u64,
-    ) -> Self {
-        Self {
-            feature_id,
-            market_id: status.market_id,
-            timestamp_mdp_in: status.timestamp_mdp_in,
-            bid: 1.0,
-            bid_volume: -1.0,
-            ask: 1.0,
-            ask_volume: -1.0,
-            event_id: status.event_id,
-            ts_mono_mdp_out,
-            mdp_received_ts_ns,
-            feature_start_ts_ns,
-            feature_done_ts_ns,
-            signal_bps: 0.0,
-        }
-    }
-
-    pub fn encode_le(&self) -> [u8; FEATURE_BBO_WIRE_LEN] {
-        let mut bytes = [0; FEATURE_BBO_WIRE_LEN];
-        bytes[0] = FEATURE_BBO_MESSAGE_TYPE;
-        put(&mut bytes, 1, self.feature_id.to_le_bytes());
-        put(&mut bytes, 5, self.market_id.to_le_bytes());
-        put(&mut bytes, 9, self.timestamp_mdp_in.to_le_bytes());
-        put(&mut bytes, 17, self.bid.to_le_bytes());
-        put(&mut bytes, 25, self.bid_volume.to_le_bytes());
-        put(&mut bytes, 33, self.ask.to_le_bytes());
-        put(&mut bytes, 41, self.ask_volume.to_le_bytes());
-        put(&mut bytes, 49, self.event_id.to_le_bytes());
-        put(&mut bytes, 57, self.ts_mono_mdp_out.to_le_bytes());
-        put(&mut bytes, 65, self.mdp_received_ts_ns.to_le_bytes());
-        put(&mut bytes, 73, self.feature_start_ts_ns.to_le_bytes());
-        put(&mut bytes, 81, self.feature_done_ts_ns.to_le_bytes());
-        put(&mut bytes, 89, self.signal_bps.to_le_bytes());
-        bytes
-    }
-
-    pub fn decode_le(bytes: &[u8]) -> Result<Self, CodecError> {
-        require_type_and_len(bytes, FEATURE_BBO_MESSAGE_TYPE, FEATURE_BBO_WIRE_LEN)?;
-        Ok(Self {
-            feature_id: read(bytes, 1, i32::from_le_bytes)?,
-            market_id: read(bytes, 5, i32::from_le_bytes)?,
-            timestamp_mdp_in: read(bytes, 9, i64::from_le_bytes)?,
-            bid: read(bytes, 17, f64::from_le_bytes)?,
-            bid_volume: read(bytes, 25, f64::from_le_bytes)?,
-            ask: read(bytes, 33, f64::from_le_bytes)?,
-            ask_volume: read(bytes, 41, f64::from_le_bytes)?,
-            event_id: read(bytes, 49, u64::from_le_bytes)?,
-            ts_mono_mdp_out: read(bytes, 57, i64::from_le_bytes)?,
-            mdp_received_ts_ns: read(bytes, 65, u64::from_le_bytes)?,
-            feature_start_ts_ns: read(bytes, 73, u64::from_le_bytes)?,
-            feature_done_ts_ns: read(bytes, 81, u64::from_le_bytes)?,
-            signal_bps: read(bytes, 89, f64::from_le_bytes)?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MarketStatus {
     pub market_id: i32,
     pub timestamp_mdp_in: i64,
@@ -360,7 +273,6 @@ pub enum WireMessage {
     Bbo(Bbo),
     Trade(Trade),
     OrderBook(OrderBook),
-    FeatureBbo(FeatureBbo),
     Other(Vec<u8>),
 }
 
@@ -373,7 +285,6 @@ impl WireMessage {
             SNAPSHOT_MESSAGE_TYPE | DEPTH_UPDATE_MESSAGE_TYPE => {
                 Ok(Self::OrderBook(OrderBook::decode_le(bytes)?))
             }
-            FEATURE_BBO_MESSAGE_TYPE => Ok(Self::FeatureBbo(FeatureBbo::decode_le(bytes)?)),
             _ => Ok(Self::Other(bytes.to_vec())),
         }
     }
@@ -424,4 +335,122 @@ fn read<const N: usize, T>(
         .try_into()
         .expect("slice length was checked");
     Ok(convert(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bbo_golden_vector_and_round_trip() {
+        let bbo = Bbo {
+            market_id: 42,
+            timestamp_mdp_in: 1,
+            bid: 100.0,
+            bid_volume: 2.0,
+            ask: 101.0,
+            ask_volume: 3.0,
+            event_id: 9,
+            ts_mono_mdp_out: 10,
+        };
+        let encoded = bbo.encode_le();
+        assert_eq!(&encoded[..5], &[1, 42, 0, 0, 0]);
+        assert_eq!(Bbo::decode_le(&encoded).unwrap(), bbo);
+    }
+
+    #[test]
+    fn trade_and_status_golden_vectors_round_trip() {
+        let trade = Trade {
+            market_id: 42,
+            timestamp_mdp_in: 1,
+            price: 100.0,
+            quantity: 2.0,
+            side: -1,
+            event_id: 9,
+            ts_mono_mdp_out: 10,
+        };
+        let trade_bytes = trade.encode_le();
+        assert_eq!(&trade_bytes[..5], &[TRADE_MESSAGE_TYPE, 42, 0, 0, 0]);
+        assert_eq!(trade_bytes[29], u8::MAX);
+        assert_eq!(Trade::decode_le(&trade_bytes).unwrap(), trade);
+
+        let status = MarketStatus {
+            market_id: 7,
+            timestamp_mdp_in: 11,
+            state: 2,
+            event_id: 12,
+            ts_mono_mdp_out: 13,
+        };
+        let status_bytes = status.encode_le();
+        assert_eq!(&status_bytes[..5], &[STATUS_MESSAGE_TYPE, 7, 0, 0, 0]);
+        assert_eq!(MarketStatus::decode_le(&status_bytes).unwrap(), status);
+    }
+
+    #[test]
+    fn order_book_round_trip_and_depth_validation() {
+        let book = OrderBook {
+            message_type: SNAPSHOT_MESSAGE_TYPE,
+            depth: 1,
+            market_id: 7,
+            update_id: 8,
+            timestamp_mdp_in: 9,
+            timestamp_matching_engine: 10,
+            timestamp: 11,
+            event_id: 12,
+            timestamp_mdp_out: 13,
+            bids: vec![(100.0, 2.0)],
+            asks: vec![(101.0, 3.0)],
+        };
+        let encoded = book.encode_le().unwrap();
+        assert_eq!(encoded.len(), ORDER_BOOK_HEADER_LEN + ORDER_BOOK_LEVEL_LEN);
+        assert_eq!(OrderBook::decode_le(&encoded).unwrap(), book);
+
+        let mut mismatched = book.clone();
+        mismatched.asks.clear();
+        assert_eq!(mismatched.encode_le(), Err(CodecError::DepthMismatch));
+
+        let truncated = &encoded[..encoded.len() - 1];
+        assert_eq!(
+            OrderBook::decode_le(truncated),
+            Err(CodecError::InvalidLength {
+                expected: encoded.len(),
+                actual: truncated.len(),
+            })
+        );
+    }
+
+    #[test]
+    fn fixed_codecs_reject_wrong_markers_and_lengths() {
+        let mut bbo = Bbo {
+            market_id: 1,
+            timestamp_mdp_in: 2,
+            bid: 3.0,
+            bid_volume: 4.0,
+            ask: 5.0,
+            ask_volume: 6.0,
+            event_id: 7,
+            ts_mono_mdp_out: 8,
+        }
+        .encode_le();
+        bbo[0] = TRADE_MESSAGE_TYPE;
+        assert_eq!(
+            Bbo::decode_le(&bbo),
+            Err(CodecError::UnexpectedType(TRADE_MESSAGE_TYPE))
+        );
+        assert_eq!(
+            Bbo::decode_le(&bbo[..BBO_WIRE_LEN - 1]),
+            Err(CodecError::InvalidLength {
+                expected: BBO_WIRE_LEN,
+                actual: BBO_WIRE_LEN - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn errors_are_not_data_messages() {
+        assert_eq!(
+            WireMessage::decode(&[5]).unwrap(),
+            WireMessage::Other(vec![5])
+        );
+    }
 }
