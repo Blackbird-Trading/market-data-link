@@ -122,7 +122,9 @@ impl ControlRequest {
         for arg in &self.args {
             arg.validate()?;
         }
-        if self.op == ControlOperation::RefetchBbo && self.args.iter().any(|arg| arg.stream != "bbo") {
+        if self.op == ControlOperation::RefetchBbo
+            && self.args.iter().any(|arg| arg.stream != "bbo")
+        {
             return Err(ProtocolError::InvalidRefetchStream);
         }
         Ok(())
@@ -248,7 +250,10 @@ mod tests {
 
     #[test]
     fn transport_selection_has_no_protocol_identity() {
-        let value = serde_json::to_value(SelectTransport::new(TransportSelection::Udp { client_port: 4000 })).unwrap();
+        let value = serde_json::to_value(SelectTransport::new(TransportSelection::Udp {
+            client_port: 4000,
+        }))
+        .unwrap();
         assert_eq!(value["op"], "select_transport");
         assert_eq!(value["transport"]["type"], "udp");
         assert!(value.get("control_version").is_none());
@@ -261,7 +266,10 @@ mod tests {
             stream_id: 1002,
         })
         .unwrap();
-        assert_eq!(aeron, r#"{"aeron_channel":{"type":"ipc"},"stream_id":1002}"#);
+        assert_eq!(
+            aeron,
+            r#"{"aeron_channel":{"type":"ipc"},"stream_id":1002}"#
+        );
 
         let udp = serde_json::to_string(&UdpConfigMessage {
             client_address: "127.0.0.1:4000".parse().unwrap(),
@@ -276,6 +284,9 @@ mod tests {
             ControlRequest::subscribe(Vec::new()).validate(),
             Err(ProtocolError::EmptyArgs)
         );
-        assert_eq!(SubscriptionArg::new([], "bbo").validate(), Err(ProtocolError::EmptyIds));
+        assert_eq!(
+            SubscriptionArg::new([], "bbo").validate(),
+            Err(ProtocolError::EmptyIds)
+        );
     }
 }
